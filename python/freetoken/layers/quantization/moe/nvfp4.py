@@ -236,7 +236,13 @@ class MarlinNvfp4MoEKernel(MoEKernel):
     def unusable_reason(self, cfg: MoEConfig) -> str | None:
         if not backend.is_vllm_installed():
             return "vLLM is not installed"
-        reason = self._common_reject(cfg, resident_ok=False, tp_ok=False, cpu_ok=False, plain_silu_only=True)
+        # TP slices the native FP4 expert rows before this kernel repacks them. The
+        # Marlin layout is built from cfg.local_intermediate, so each rank owns a
+        # complete gate/up and down shard and the Qwen4Exp MoE block reduces the
+        # resulting partial output once. This is the same W4A16 path as TP1; the
+        # only additional requirement is that the TP-local dimensions satisfy the
+        # existing Marlin tile constraints.
+        reason = self._common_reject(cfg, resident_ok=False, tp_ok=True, cpu_ok=False, plain_silu_only=True)
         if reason:
             return reason
         if not _marlin_symbols_ok():
