@@ -19,6 +19,7 @@ from freetoken.kernel.aot_models import SUPPORTED_MODELS, expert_bank_row_bytes
 from freetoken.models.qwen4_exp.weight import (
     _ZERO_CENTERED_NORM_SUFFIXES,
     _DenseFuser,
+    _shard,
     iter_weights,
     load_ple_table,
 )
@@ -37,6 +38,39 @@ IHD = 64  # indexer head dim
 BLOCK = 128
 E, I = 3, 6  # routed experts, moe_intermediate_size
 NGRAM_DIM, NGRAM_ROWS, NGRAM_SHARDS = 4, 7, 4
+
+
+def test_tp2_shards_quantized_gdn_qkvz_weight_and_block_scales():
+    """The split FP8 qkv|z projection must shard heads and its 128-row scale grid together."""
+    group = SimpleNamespace(
+        num_key_heads=2,
+        num_value_heads=4,
+        key_head_dim=128,
+        value_head_dim=128,
+    )
+    config = SimpleNamespace(linear_attention_group=lambda: group)
+    weight = torch.arange((2 + 2 + 4 + 4) * 128 * 256, dtype=torch.float32).reshape(
+        (2 + 2 + 4 + 4) * 128, 256
+    )
+    scales = torch.arange(12 * 2, dtype=torch.float32).reshape(12, 2)
+    weight_parts = [_shard("model.layers.0.linear_attn.in_proj_qkvz.weight", weight, config, r, 2) for r in (0, 1)]
+    scale_parts = [
+        _shard("model.layers.0.linear_attn.in_proj_qkvz.weight_scale_inv", scales, config, r, 2)
+        for r in (0, 1)
+    ]
+    assert [part.shape for part in weight_parts] == [(768, 256), (768, 256)]
+    assert [part.shape for part in scale_parts] == [(6, 2), (6, 2)]
+    expected_weight = [
+        torch.cat([weight[0:128], weight[256:384], weight[512:768], weight[1024:1280]]),
+        torch.cat([weight[128:256], weight[384:512], weight[768:1024], weight[1280:1536]]),
+    ]
+    expected_scales = [
+        torch.cat([scales[0:1], scales[2:3], scales[4:6], scales[8:10]]),
+        torch.cat([scales[1:2], scales[3:4], scales[6:8], scales[10:12]]),
+    ]
+    for rank in (0, 1):
+        assert torch.equal(weight_parts[rank], expected_weight[rank])
+        assert torch.equal(scale_parts[rank], expected_scales[rank])
 
 
 @pytest.fixture(scope="session", autouse=True)

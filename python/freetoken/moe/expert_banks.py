@@ -11,6 +11,7 @@ from __future__ import annotations
 import glob
 import math
 import os
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 
 import torch
@@ -75,6 +76,7 @@ def build_expert_banks(
     device: torch.device,
     layer_sink=None,
     dummy: bool = False,
+    shared_cache=None,
 ) -> ExpertBanks:
     """Fill host banks in the kernel's layout from a stream of expert pieces.
 
@@ -91,62 +93,91 @@ def build_expert_banks(
     layout = method.layout()
     E = method.cfg.num_experts
     specs = {role: ((E, *spec.shape), spec.dtype) for role, spec in layout.items() if not spec.resident}
-    hb = alloc_layer_banks(specs, num_layers)
-    banks = {role: [b.tensor for b in hb[role]] for role in specs}
-    alphas = {
-        role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
-        for role, spec in layout.items() if spec.resident
-    }
+    # The lock is held across the complete first build.  A second endpoint therefore waits
+    # before allocating its own ~68-GiB anonymous bank, then maps the finished shared files.
+    lock = shared_cache.exclusive() if shared_cache is not None and not dummy else nullcontext()
+    with lock:
+        if shared_cache is not None and not dummy:
+            cached = shared_cache.load(device=device)
+            if cached is not None:
+                cached_sources, cached_alphas = cached
+                logger.info_rank0(f"expert banks: shared host cache hit ({shared_cache.root})")
+                return ExpertBanks(
+                    legacy_format_for(method.kind, kernel.name), cached_sources,
+                    gate_up_alpha=cached_alphas.get("gate_up_alpha"),
+                    down_alpha=cached_alphas.get("down_alpha"),
+                    kind=method.kind, kernel=kernel.name, layout=layout,
+                )
 
-    if dummy:
-        for role, per_layer in banks.items():
-            for tensor in per_layer:
-                _dummy_fill(role, tensor)
-        for alpha in alphas.values():
-            alpha.fill_(1.0)
-        if torch.cuda.is_available():
-            pin_banks(hb)
+        if shared_cache is not None:
+            # Map the shared tmpfs files before packing so the first endpoint never holds an
+            # anonymous bank and a second full copy at the same time.
+            hb, banks = shared_cache.allocate(specs, num_layers)
+        else:
+            hb = alloc_layer_banks(specs, num_layers)
+            banks = {role: [b.tensor for b in hb[role]] for role in specs}
+        alphas = {
+            role: torch.empty(num_layers * E, dtype=spec.dtype, device=device)
+            for role, spec in layout.items() if spec.resident
+        }
+
+        if dummy:
+            for role, per_layer in banks.items():
+                for tensor in per_layer:
+                    _dummy_fill(role, tensor)
+            for alpha in alphas.values():
+                alpha.fill_(1.0)
+            if torch.cuda.is_available():
+                pin_banks(hb)
+            return ExpertBanks(
+                legacy_format_for(method.kind, kernel.name), banks,
+                gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
+                kind=method.kind, kernel=kernel.name, layout=layout,
+            )
+
+        def _fill(sink) -> None:
+            tracker = LayerCompletionTracker(E, hb, sink) if sink is not None else None
+            # a reader that skips a layer or mislabels a piece must fail here, not serve uninitialized rows
+            written = torch.zeros(num_layers, E, dtype=torch.int32)
+            for layer_id, e0, e1, piece in pieces:
+                if not (0 <= layer_id < num_layers and 0 <= e0 < e1 <= E):
+                    raise ValueError(f"expert piece out of range: layer {layer_id}, experts {e0}:{e1} of {num_layers} x {E}")
+                # refuse before writing: a duplicate row would also complete the layer early and hand the sink a half-filled bank
+                if written[layer_id, e0:e1].any():
+                    raise ValueError(f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}")
+                written[layer_id, e0:e1] = 1
+                out = {role: banks[role][layer_id][e0:e1] for role in specs}
+                got = method.pack(piece, out)
+                for role, values in got.items():
+                    alphas[role][layer_id * E + e0 : layer_id * E + e1] = values.to(alphas[role].dtype)
+                if tracker is not None:
+                    for _ in range(e1 - e0):
+                        tracker.note(layer_id)
+            missing = (written == 0).nonzero().tolist()
+            if missing:
+                raise ValueError(f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
+
+        if layer_sink is not None:
+            _fill(layer_sink)
+        elif shared_cache is not None:
+            # Keep the newly packed anonymous mmaps pageable until each bank has been
+            # written directly to its shared file.  This avoids trying to unregister a
+            # 68-GiB cudaHostRegister allocation during the handoff.
+            _fill(None)
+        elif torch.cuda.is_available():
+            with PinPipeline() as pins:
+                _fill(pins)
+        else:
+            _fill(None)
+
+        if shared_cache is not None:
+            banks, alphas = shared_cache.finalize(hb, banks, alphas, device=device)
+
         return ExpertBanks(
             legacy_format_for(method.kind, kernel.name), banks,
             gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
-            kind=method.kind, kernel=kernel.name, layout=layout,
+            streamed=layer_sink is not None, kind=method.kind, kernel=kernel.name, layout=layout,
         )
-
-    def _fill(sink) -> None:
-        tracker = LayerCompletionTracker(E, hb, sink) if sink is not None else None
-        # a reader that skips a layer or mislabels a piece must fail here, not serve uninitialized rows
-        written = torch.zeros(num_layers, E, dtype=torch.int32)
-        for layer_id, e0, e1, piece in pieces:
-            if not (0 <= layer_id < num_layers and 0 <= e0 < e1 <= E):
-                raise ValueError(f"expert piece out of range: layer {layer_id}, experts {e0}:{e1} of {num_layers} x {E}")
-            # refuse before writing: a duplicate row would also complete the layer early and hand the sink a half-filled bank
-            if written[layer_id, e0:e1].any():
-                raise ValueError(f"expert rows written more than once: layer {layer_id}, experts {e0}:{e1}")
-            written[layer_id, e0:e1] = 1
-            out = {role: banks[role][layer_id][e0:e1] for role in specs}
-            got = method.pack(piece, out)
-            for role, values in got.items():
-                alphas[role][layer_id * E + e0 : layer_id * E + e1] = values.to(alphas[role].dtype)
-            if tracker is not None:
-                for _ in range(e1 - e0):
-                    tracker.note(layer_id)
-        missing = (written == 0).nonzero().tolist()
-        if missing:
-            raise ValueError(f"expert banks were not filled: {len(missing)} (layer, expert) rows missing (first {missing[:4]})")
-
-    if layer_sink is not None:
-        _fill(layer_sink)
-    elif torch.cuda.is_available():
-        with PinPipeline() as pins:
-            _fill(pins)
-    else:
-        _fill(None)
-
-    return ExpertBanks(
-        legacy_format_for(method.kind, kernel.name), banks,
-        gate_up_alpha=alphas.get("gate_up_alpha"), down_alpha=alphas.get("down_alpha"),
-        streamed=layer_sink is not None, kind=method.kind, kernel=kernel.name, layout=layout,
-    )
 
 
 _PARALLEL_CHUNK = 8 << 20  # default O_DIRECT chunk for the parallel reader
@@ -192,16 +223,25 @@ def _legacy_expert_banks(model_path, model_config, device, dtype, dummy, paralle
     )
 
 
-def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None) -> ExpertBanks:
+def _method_expert_banks(model_path, model_config, method, device, dummy, parallel, workers, chunk, layer_sink=None, shared_bank_dir=None) -> ExpertBanks:
     from freetoken.moe.expert_pieces import iter_expert_pieces
 
     num_layers = model_config.num_moe_layers
+    shared_cache = None
+    if shared_bank_dir and not dummy and layer_sink is None:
+        from freetoken.moe.shared_banks import SharedBankCache
+
+        shared_cache = SharedBankCache.for_method(shared_bank_dir, model_path, model_config, method)
+        logger.info_rank0(f"expert banks: shared host cache requested ({shared_cache.root})")
     if dummy:
         return build_expert_banks(method, num_layers, None, device=device, dummy=True)
     pieces = iter_expert_pieces(
         model_path, model_config, method.kind, parallel=parallel, workers=workers, chunk=chunk
     )
-    return build_expert_banks(method, num_layers, pieces, device=device, layer_sink=layer_sink)
+    return build_expert_banks(
+        method, num_layers, pieces, device=device, layer_sink=layer_sink,
+        shared_cache=shared_cache,
+    )
 
 
 def _host_ram_fits_parallel(model_path: str) -> bool:
@@ -286,6 +326,7 @@ def load_expert_banks(
     decode_target: str = "gpu",
     layer_sink=None,
     layer_residency: list[str] | None = None,
+    shared_bank_dir: str | None = None,
 ) -> ExpertBanks:
     """Load (or fabricate, with ``dummy=True``) the expert banks. Two paths, both returning
     the same normalized ``ExpertBanks`` and both pinning after fill:
@@ -314,6 +355,11 @@ def load_expert_banks(
     from freetoken.checkpoint.ftw import is_ftw_checkpoint, load_ftw_banks
 
     if model_path and is_ftw_checkpoint(model_path) and not dummy:
+        if shared_bank_dir:
+            logger.warning_rank0(
+                "--moe-shared-bank-dir is currently used for raw checkpoint repacks; "
+                "the FTW loader will keep its normal per-process bank mappings"
+            )
         banks = load_ftw_banks(
             model_path, num_layers=model_config.num_moe_layers, workers=workers, chunk=chunk,
             layer_residency=layer_residency,
@@ -354,7 +400,10 @@ def load_expert_banks(
 
     def _build(par: bool) -> ExpertBanks:
         if method is not None:
-            return _method_expert_banks(model_path, model_config, method, device, dummy, par, workers, chunk, layer_sink)
+            return _method_expert_banks(
+                model_path, model_config, method, device, dummy, par, workers, chunk,
+                layer_sink, shared_bank_dir,
+            )
         return _legacy_expert_banks(model_path, model_config, device, dtype, dummy, par, workers, chunk, decode_target, layer_sink)
 
     with requested_residency(layer_residency) as residency_plan:

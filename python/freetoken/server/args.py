@@ -281,6 +281,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--dense-quant",
+        choices=["none", "fp8"],
+        default=ServerArgs.dense_quant,
+        help=(
+            "Convert eligible BF16 dense weights to per-row FP8 W8A16 at load time. "
+            "Native checkpoint-quantized layers and routing/state projections keep their format."
+        ),
+    )
+
+    parser.add_argument(
         "--gpu",
         type=_lazy_gpu_arg,
         default=ServerArgs.gpu,
@@ -644,6 +654,20 @@ def parse_args(
             "experts in parallel (fast) but falls back to serial when free RAM can't cover "
             "the banks + the parallel reader's extra whole-shard buffer; 'serial' forces the "
             "low-memory reclaimable read (slower); 'parallel' forces the fast read."
+        ),
+    )
+
+    parser.add_argument(
+        "--moe-shared-bank-dir",
+        default=ServerArgs.moe_shared_bank_dir,
+        help=(
+            "Optional directory for a shared, file-backed packed expert-bank cache. "
+            "The first endpoint packs directly into shared tmpfs files; later independent "
+            "endpoints map the same host pages instead of duplicating the full MoE bank in RAM. "
+            "Use a large tmpfs path such as /dev/shm; ext4 shared mappings cannot be CUDA-registered. "
+            "Use one directory for the same model and TP layout; the cache is keyed and "
+            "built under a lock. Raw checkpoint repacks are supported; FTW inputs keep "
+            "their normal loader for now."
         ),
     )
 

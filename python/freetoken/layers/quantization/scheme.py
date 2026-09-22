@@ -20,6 +20,7 @@ class QuantKind(Enum):
     MXFP8 = "mxfp8"
     NVFP4 = "nvfp4"
     MXFP4 = "mxfp4"
+    AWQ = "awq"
 
     def __str__(self) -> str:
         return self.value
@@ -28,6 +29,7 @@ class QuantKind(Enum):
 FP8_BLOCK = 128
 NVFP4_GROUP = 16
 MX_GROUP = 32
+AWQ_GROUP = 32
 
 
 @dataclass(frozen=True)
@@ -95,3 +97,12 @@ def nvfp4_scheme(*, input_scale: bool) -> QuantScheme:
 
 def mxfp4_scheme() -> QuantScheme:
     return QuantScheme(QuantKind.MXFP4, WeightDesc("e2m1", (1, MX_GROUP), "e8m0"), {"weight", "weight_scale"})
+
+
+def awq_scheme() -> QuantScheme:
+    """Asymmetric GEMM-AWQ W4A16 with packed output columns and g32 scales."""
+    return QuantScheme(
+        QuantKind.AWQ,
+        WeightDesc("i4", (AWQ_GROUP, 1), "bf16"),
+        {"qweight", "qzeros", "scales"},
+    )

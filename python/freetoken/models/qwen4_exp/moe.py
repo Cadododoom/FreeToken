@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import torch
-import torch.nn.functional as F
 from freetoken.core import get_global_ctx
 from freetoken.distributed import DistributedCommunicator, get_tp_info
 from freetoken.kernel.triton.moe_shared_gate import shared_gate_mul_add, shared_gate_sigmoid
@@ -43,7 +42,12 @@ class Qwen4ExpMoE(Qwen3_5MoE):
             and isinstance(se.down_proj, LinearRowParallel)
             and isinstance(ex, OffloadMoELayer)
         ):
-            shared = F.linear(silu_and_mul(se.gate_up_proj.forward(hidden_states)), se.down_proj.weight)
+            # Apply the selected dense kernel directly so load-time FP8 (and future INT4)
+            # shared-expert weights remain compatible with the one fused TP all-reduce below.
+            # Calling down_proj.forward() here would all-reduce before routed + gated fusion.
+            shared = se.down_proj.quant_method.apply(
+                se.down_proj, silu_and_mul(se.gate_up_proj.forward(hidden_states))
+            )
             if get_global_ctx().batch.is_prefill:
                 routed = ex.prefill_forward(hidden_states, router_logits)
             else:

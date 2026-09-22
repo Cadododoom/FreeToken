@@ -36,6 +36,38 @@ from freetoken.kernel.triton.e4m3_compat import (
 FP8 = torch.float8_e4m3fn
 _TL_DTYPE = {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}
 
+# Load-time W8A16 uses a per-output-row scale.  Keep this helper here, next to the
+# runtime FP8 implementation, so CPU-staged checkpoint conversion and the GPU kernel
+# share the same FP8 format and scale convention.
+_FP8_MAX = 448.0
+
+
+def quantize_fp8_per_row(
+    weight: torch.Tensor, chunk_rows: int = 8192,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 2-D floating-point matrix to FP8 E4M3 with one scale per row.
+
+    The scale is the row absolute maximum divided by the finite E4M3 range.  Returning
+    the scale separately matches :class:`Fp8TensorMethod`'s W8A16 representation and
+    keeps peak temporary memory bounded for large dense projections.
+    """
+    if weight.ndim != 2:
+        raise ValueError(f"per-row FP8 quantization expects a matrix, got {tuple(weight.shape)}")
+    if chunk_rows <= 0:
+        raise ValueError(f"chunk_rows must be positive, got {chunk_rows}")
+
+    q = torch.empty(weight.shape, dtype=FP8, device=weight.device)
+    scale = torch.empty((weight.shape[0],), dtype=torch.float32, device=weight.device)
+    for row_start in range(0, weight.shape[0], chunk_rows):
+        row_end = min(row_start + chunk_rows, weight.shape[0])
+        rows = weight[row_start:row_end].float()
+        row_scale = (rows.abs().amax(dim=1) / _FP8_MAX).clamp(min=1e-12)
+        q[row_start:row_end] = (
+            rows / row_scale[:, None]
+        ).clamp(-_FP8_MAX, _FP8_MAX).to(FP8)
+        scale[row_start:row_end] = row_scale
+    return q, scale
+
 
 # Row-wise _scaled_mm on sm_89 with torch < 2.12 launches its CUTLASS stream-K kernel off the
 # current stream (pytorch/pytorch#177651, fixed by pytorch/pytorch@252bb4a; #182/#72/#220), and

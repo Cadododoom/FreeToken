@@ -75,6 +75,17 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     # DeepSeek-V4 FP4: packed e2m1 codes + e8m0 per-32 block scales, no global scale
     # (4 banks). Read by DeepSeek-V4's own DS-FP4 grouped GEMV kernels via bank_views().
     "ds_fp4": ("gate_up_packed", "gate_up_scale", "down_packed", "down_scale"),
+    # GEMM-AWQ reference banks: qweight/qzeros pack eight output columns per int32;
+    # scales remain bf16 in [group, output] order.
+    "awq": (
+        "gate_up_qweight", "gate_up_qzeros", "gate_up_scales",
+        "down_qweight", "down_qzeros", "down_scales",
+    ),
+    # vLLM Marlin-tiled AWQ: same logical roles, different row shapes.
+    "awq_marlin": (
+        "gate_up_qweight", "gate_up_qzeros", "gate_up_scales",
+        "down_qweight", "down_qzeros", "down_scales",
+    ),
 }
 
 # lives in kernel/aot_models.py: the AOT row table shares it and must stay importable in the torch-only kernel-cache build env, which cannot import freetoken.moe
@@ -93,6 +104,22 @@ _BANK_BYTES_PER_EXPERT = {
     "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
+    "awq": lambda H, I: (
+        2 * H * (I // 8) * 4
+        + 2 * (H // 32) * (I // 8) * 4
+        + 2 * (H // 32) * I * 2
+        + I * (H // 8) * 4
+        + (I // 32) * (H // 8) * 4
+        + (I // 32) * H * 2
+    ),
+    "awq_marlin": lambda H, I: (
+        (H // 16) * (4 * I) * 4
+        + (H // 32) * (2 * I // 8) * 4
+        + (H // 32) * (2 * I) * 2
+        + (I // 16) * (2 * H) * 4
+        + (I // 32) * (H // 8) * 4
+        + (I // 32) * H * 2
+    ),
 }
 
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert

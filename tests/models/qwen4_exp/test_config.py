@@ -76,6 +76,16 @@ def _hf_config(quantization_config=RADIXARK_NVFP4):
     )
 
 
+AWQ_EXPERTS = {
+    "quant_method": "awq",
+    "bits": 4,
+    "group_size": 32,
+    "version": "gemm",
+    "zero_point": True,
+    "modules_to_not_convert": ["self_attn", "linear_attn", "mlp.gate", "shared_expert", "ple", "mtp", "visual"],
+}
+
+
 def test_groups_and_layer_split():
     cfg = parse_config(_hf_config())
     full = [g for g in cfg.attention_groups if isinstance(g, FullAttentionGroupConfig)]
@@ -116,6 +126,7 @@ def test_moe_dims():
         pytest.param(RADIXARK_NVFP4, "nvfp4", id="RadixArk/Qwen3.8-Flash-Next-NVFP4"),
         pytest.param(NVIDIA_NVFP4, "nvfp4", id="nvidia/Qwen3.8-Flash-Next-NVFP4"),
         pytest.param(QWEN_FP8, "fp8_block", id="Qwen/Qwen3.8-Flash-Next-FP8"),
+        pytest.param(AWQ_EXPERTS, "awq", id="Qwen3.8-Flash-Next-AWQ-g32"),
         pytest.param(None, "none", id="Qwen/Qwen3.8-Flash-Next"),
     ],
 )

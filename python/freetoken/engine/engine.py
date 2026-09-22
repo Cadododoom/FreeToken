@@ -6,7 +6,7 @@ import gc
 import math
 import os
 from datetime import timedelta
-from typing import Any, Dict, Iterable, NamedTuple, Tuple
+from typing import Any, Dict, Iterable, Iterator, NamedTuple, Tuple
 
 import torch
 from freetoken.attention import AttnType, attention_backend_info, create_attention_backend
@@ -318,6 +318,39 @@ def _materialize_loaded_weight_state_dict(
     return state_dict
 
 
+def _quantize_at_load(
+    weights: Iterable[Tuple[str, torch.Tensor]], model_state: Dict[str, torch.Tensor]
+) -> Iterator[Tuple[str, torch.Tensor]]:
+    """Convert BF16 tensors into the model's load-time FP8 buffers without GPU spikes."""
+    from freetoken.kernel.triton.fp8_pertensor_linear import FP8, quantize_fp8_per_row
+
+    quantized = 0
+    for key, weight in weights:
+        expected = model_state.get(key)
+        scale_key = key[:-len(".weight")] + ".weight_scale" if key.endswith(".weight") else None
+        if (
+            expected is not None
+            and expected.dtype == FP8
+            and weight.dtype != FP8
+            and weight.is_floating_point()
+            and scale_key in model_state
+        ):
+            # Safetensors readers normally place weights on the serving GPU.  Stage the source
+            # through host RAM so BF16, FP8, and the temporary FP32 row buffer do not coexist on
+            # a 10 GB Ampere card during startup.
+            if weight.device.type == "cuda":
+                host_weight = weight.to(device="cpu")
+                del weight
+                weight = host_weight
+            q, scale = quantize_fp8_per_row(weight)
+            quantized += 1
+            yield key, q
+            yield scale_key, scale
+        else:
+            yield key, weight
+    logger.info_rank0(f"--dense-quant: quantized {quantized} dense projections to per-row fp8 at load")
+
+
 class ForwardOutput(NamedTuple):
     next_tokens_gpu: torch.Tensor
     next_tokens_cpu: torch.Tensor
@@ -542,14 +575,19 @@ class Engine:
         # _materialize casts each loaded tensor to its model-param dtype (model_state), so
         # models declaring per-tensor dtypes (e.g. DSV4's mixed fp8/fp32/bf16) are preserved;
         # offload models exclude experts (served from the offload cache, not dense weights).
+        weights = load_weight(
+            config.model_path,
+            # Load-time conversion must see the source on CPU; the final compact buffers are
+            # copied to the serving GPU by _materialize_loaded_weight_state_dict.
+            torch.device("cpu") if config.dense_quant == "fp8" else self.device,
+            include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
+            include_vision=bool(config.active_encoders),
+        )
+        if config.dense_quant == "fp8":
+            weights = _quantize_at_load(weights, model_state)
         return _materialize_loaded_weight_state_dict(
             model_state,
-            load_weight(
-                config.model_path,
-                self.device,
-                include_moe_experts=not is_offload_moe_strategy(config.moe_strategy),
-                include_vision=bool(config.active_encoders),
-            ),
+            weights,
             device=self.device,
         )
 
@@ -678,6 +716,7 @@ class Engine:
                     parallel=expert_parallel,
                     decode_target=("cpu" if decode_target in ("cpu", "hybrid") else "gpu"),
                     layer_residency=requested_residency,
+                    shared_bank_dir=config.moe_shared_bank_dir,
                 )
         except PinFailed as exc:
             raise RuntimeError(f"{exc}; {_pin_hint(self._host_tables_bytes)}") from exc

@@ -30,6 +30,8 @@ class EngineConfig:
     moe_backend: str | None = field(default=None, repr=False)
     # --quant-backend: layer[.kind]=kernel entries, comma separated
     quant_backend: str | None = None
+    # --dense-quant: convert eligible checkpoint BF16 dense projections to per-row FP8 at load.
+    dense_quant: str = "none"
     # PLE table backend: "disk" (default) reads rows from the checkpoint files per fill, "pinned" preloads the table into page-locked host RAM.
     ple_backend: str = "disk"
     # Expert-bank host load (--expert-load): auto|serial|parallel. "auto" reads scattered
@@ -37,6 +39,10 @@ class EngineConfig:
     # parallel reader's extra (non-reclaimable) whole-shard buffer; "serial" forces the
     # low-memory reclaimable read; "parallel" forces the fast read.
     expert_load: str = "auto"
+    # Optional model-specific, file-backed host-bank cache shared by independent serve
+    # processes. The first process packs directly into shared tmpfs files; later processes
+    # map the same physical pages instead of allocating another full expert bank in RAM.
+    moe_shared_bank_dir: str | None = None
     moe_cache_size: int = 0
     moe_cache_rate: float | None = None
     moe_cache_auto: bool = False
@@ -134,6 +140,12 @@ class EngineConfig:
                 setattr(hf_config, key, None)
         spec = self.model_spec
         quant = checkpoint_quant_config(self.model_path, hf_config, spec)
+        if self.dense_quant == "fp8":
+            from freetoken.layers.quantization.at_load import LoadTimeFp8Config
+
+            quant = LoadTimeFp8Config(quant)
+        elif self.dense_quant != "none":
+            raise ValueError(f"--dense-quant {self.dense_quant!r}: supported values are none, fp8")
         set_quant_config(quant)
         model_config = _load_attr(spec.module, spec.parse_config)(hf_config)
         return replace(model_config, quant=quant)

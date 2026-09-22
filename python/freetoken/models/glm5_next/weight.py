@@ -3,7 +3,11 @@
 Supported checkpoints, all in the multimodal-wrapper layout (``model.language_model.*``):
 NVFP4 exports (ModelOpt tensor kinds from LibertAIDAI, compressed-tensors kinds from
 RedHatAI, selected by ``quantization_config``) and the zai-org block-fp8 release. Not
-supported: text-only key layouts, TP > 1, resident routed experts.
+supported: text-only key layouts, resident routed experts.
+
+TP uses a hybrid layout: KDA heads, routed expert rows/columns, and vocabulary
+rows are sharded, while DSA attention and dense/shared paths stay whole on every
+rank. This is intentional until native DSA tensor parallelism is available.
 
 Routed experts go to the offload cache from their NVFP4 or block-fp8 pieces; every
 other projection loads as stored (bf16, or fp8 codes with their block scales) with keys
@@ -31,11 +35,11 @@ import torch
 from freetoken.distributed import get_tp_info
 from freetoken.layers.quantization import QuantKind
 from freetoken.models.glm_moe_dsa.weight import _ShardReader
-from freetoken.models.loader import drop_page_cache
+from freetoken.models.loader import drop_page_cache, shard_tensor
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
-from freetoken.utils import cached_load_hf_config, download_hf_weight
+from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight
 from tqdm import tqdm
 
 from .args import Glm5NextArgs
@@ -101,12 +105,41 @@ _FP8_EXPERT_RE = re.compile(
 )
 
 
-def _proj(reader, src: str, dst: str) -> Iterator[tuple[str, torch.Tensor]]:
+def _tp_slice_axis(tensor: torch.Tensor, axis: int) -> torch.Tensor:
+    """Contiguous rank slice for a TP-sharded output/input axis."""
+    tp = get_tp_info()
+    if tp.size == 1:
+        return tensor
+    full = tensor.shape[axis]
+    local = div_even(full, tp.size)
+    lo = tp.rank * local
+    return tensor.narrow(axis, lo, local).contiguous()
+
+
+def _proj(
+    reader,
+    src: str,
+    dst: str,
+    *,
+    row_shard: bool = False,
+    col_shard: bool = False,
+) -> Iterator[tuple[str, torch.Tensor]]:
     """One projection as the checkpoint stores it: bf16, or fp8 codes with their block scales."""
     w = reader.get(f"{src}.weight")
+    if row_shard and col_shard:
+        raise ValueError("a projection cannot be sharded on both axes")
+    if row_shard:
+        w = _tp_slice_axis(w, 0)
+    elif col_shard:
+        w = _tp_slice_axis(w, 1)
     if w.dtype == torch.float8_e4m3fn:
         yield f"{dst}.weight", w
-        yield f"{dst}.weight_scale_inv", reader.get(f"{src}.weight_scale_inv")
+        scale = reader.get(f"{src}.weight_scale_inv")
+        if row_shard:
+            scale = _tp_slice_axis(scale, 0)
+        elif col_shard:
+            scale = _tp_slice_axis(scale, 1)
+        yield f"{dst}.weight_scale_inv", scale
     else:
         yield f"{dst}.weight", w.to(torch.bfloat16)
 
@@ -122,18 +155,31 @@ def _iter_kda_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
     parts = [reader.get(f"{src}.{p}.weight") for p in _KDA_IN_PROJ]
     if any(p.dtype == torch.float8_e4m3fn for p in parts):
         raise NotImplementedError("fp8 KDA input projections are not fused by this reader")
-    yield f"{dst}.in_proj.weight", torch.cat([p.to(torch.bfloat16) for p in parts], dim=0)
+    # q|k|v|b are head/channel sharded; the low-rank f_a|g_a projections are
+    # replicated because they feed a per-rank head slice in f_b/g_b below.
+    local_parts = [
+        *[_tp_slice_axis(p, 0) for p in parts[:4]],
+        parts[4],
+        parts[5],
+    ]
+    yield f"{dst}.in_proj.weight", torch.cat(
+        [p.to(torch.bfloat16) for p in local_parts], dim=0
+    )
     # One merged depthwise conv over the q|k|v stream (channel-axis concat).
     conv = torch.cat(
-        [reader.get(f"{src}.{p}_conv1d.weight").to(torch.bfloat16) for p in ("q", "k", "v")],
+        [
+            _tp_slice_axis(reader.get(f"{src}.{p}_conv1d.weight"), 0).to(torch.bfloat16)
+            for p in ("q", "k", "v")
+        ],
         dim=0,
     )
     yield f"{dst}.conv1d.weight", conv
-    for p in ("f_b_proj", "g_b_proj", "o_proj"):
-        yield from _proj(reader, f"{src}.{p}", f"{dst}.{p}")
+    for p in ("f_b_proj", "g_b_proj"):
+        yield from _proj(reader, f"{src}.{p}", f"{dst}.{p}", row_shard=True)
+    yield from _proj(reader, f"{src}.o_proj", f"{dst}.o_proj", col_shard=True)
     # Gate params stay fp32 (the recurrent kernels read them as fp32).
-    yield f"{dst}.A_log", reader.get(f"{src}.A_log").to(torch.float32)
-    yield f"{dst}.dt_bias", reader.get(f"{src}.dt_bias").to(torch.float32)
+    yield f"{dst}.A_log", _tp_slice_axis(reader.get(f"{src}.A_log"), 0).to(torch.float32)
+    yield f"{dst}.dt_bias", _tp_slice_axis(reader.get(f"{src}.dt_bias"), 0).to(torch.float32)
     yield f"{dst}.o_norm.weight", reader.get(f"{src}.o_norm.weight").to(torch.bfloat16)
 
 
@@ -164,6 +210,64 @@ def _iter_vision(reader, weight_map: dict) -> Iterator[tuple[str, torch.Tensor]]
             yield "visual." + name[len("model.visual.") :], reader.get(name).to(torch.bfloat16)
 
 
+def _shard_vocab(name: str, tensor: torch.Tensor) -> torch.Tensor:
+    """Return this rank's vocab rows for the TP embedding/head."""
+    tp = get_tp_info()
+    if tp.size == 1:
+        return tensor
+    return shard_tensor(name, tensor, rank=tp.rank, world_size=tp.size, num_kv_heads=None)
+
+
+def _shard_fp8_expert(
+    proj: str,
+    kind: str,
+    tensor: torch.Tensor,
+    intermediate: int,
+    tp_size: int,
+    tp_rank: int,
+) -> torch.Tensor:
+    """Shard one GLM block-FP8 expert along its intermediate dimension.
+
+    Gate/up own intermediate rows; down owns intermediate columns. The companion
+    ``weight_scale_inv`` is a 128x128 block grid and is sliced on the matching
+    block axis before the local expert bank is packed.
+    """
+    if tp_size == 1:
+        return tensor
+    if intermediate % tp_size:
+        raise ValueError(
+            f"GLM-5.3 expert intermediate {intermediate} is not divisible by TP {tp_size}"
+        )
+    local = intermediate // tp_size
+    lo = tp_rank * local
+    axis = 0 if proj in ("gate", "up") else 1
+    if kind == "weight":
+        if tensor.ndim != 2 or tensor.shape[axis] != intermediate:
+            raise ValueError(
+                f"unexpected GLM-5.3 FP8 {proj} weight shape {tuple(tensor.shape)}"
+            )
+        sl = [slice(None)] * tensor.ndim
+        sl[axis] = slice(lo, lo + local)
+        return tensor[tuple(sl)].contiguous()
+    if kind == "weight_scale_inv":
+        block = 128
+        if intermediate % block or local % block or tensor.ndim != 2:
+            raise ValueError(
+                f"GLM-5.3 FP8 expert scale grid is incompatible with intermediate {intermediate}: {tuple(tensor.shape)}"
+            )
+        blocks = intermediate // block
+        if tensor.shape[axis] != blocks:
+            raise ValueError(
+                f"unexpected GLM-5.3 FP8 {proj} scale shape {tuple(tensor.shape)}"
+            )
+        block_lo = lo // block
+        block_count = local // block
+        sl = [slice(None)] * tensor.ndim
+        sl[axis] = slice(block_lo, block_lo + block_count)
+        return tensor[tuple(sl)].contiguous()
+    raise ValueError(f"unexpected GLM-5.3 FP8 expert tensor kind {kind!r}")
+
+
 def iter_weights(
     model_path: str,
     device: torch.device,
@@ -176,11 +280,6 @@ def iter_weights(
         "GLM-5.3 routed experts only serve from the offload cache; they are loaded from their expert pieces."
     )
     assert include_non_moe
-    if get_tp_info().size > 1:
-        # The loader emits full fused KDA/DSA tensors; TP sharding (per-head q|k|v|b
-        # splits, replicated f_a|g_a, row-parallel o_proj) is not implemented yet --
-        # same status as every other linear-hybrid / offload-family model in tree.
-        raise NotImplementedError("glm5_next weight loading currently supports TP=1 only")
     config = parse_config(cached_load_hf_config(model_path))
     args: Glm5NextArgs = config.glm5_args
     folder = download_hf_weight(model_path)
@@ -227,11 +326,14 @@ def iter_weights(
                 for proj in ("gate_proj", "up_proj", "down_proj"):
                     yield from _proj(reader, f"{src}.mlp.shared_experts.{proj}", f"{dst}.mlp.shared_experts.{proj}")
 
-        yield f"{_MODEL}.embed_tokens.weight", reader.get(
-            f"{_CKPT}.embed_tokens.weight"
-        ).to(torch.bfloat16)
+        embed_name = f"{_MODEL}.embed_tokens.weight"
+        yield embed_name, _shard_vocab(
+            embed_name, reader.get(f"{_CKPT}.embed_tokens.weight").to(torch.bfloat16)
+        )
         yield f"{_MODEL}.norm.weight", reader.get(f"{_CKPT}.norm.weight").to(torch.bfloat16)
-        yield "lm_head.weight", reader.get("lm_head.weight").to(torch.bfloat16)
+        yield "lm_head.weight", _shard_vocab(
+            "lm_head.weight", reader.get("lm_head.weight").to(torch.bfloat16)
+        )
         if include_vision:
             yield from _iter_vision(reader, weight_map)
     finally:
@@ -254,12 +356,11 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
     """Block-fp8 routed experts, one piece per expert: ``{gate, up, down}`` fp8 codes and their ``_scale`` companions; other kinds use the generic readers."""
     if kind is not QuantKind.FP8_BLOCK:
         return None
-    if get_tp_info().size > 1:
-        raise NotImplementedError("glm5_next fp8 expert banks support TP=1 only")
     from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
     from freetoken.moe.expert_pieces import per_expert_pieces
 
     suffix = {"weight": "", "weight_scale_inv": "_scale"}
+    tp = get_tp_info()
 
     def locate(raw_name: str):
         m = _FP8_EXPERT_RE.match(raw_name)
@@ -270,12 +371,27 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
             return None
         return bank, int(m["expert"]), m["proj"] + suffix[m["kind"]]
 
+    def sharded_tensors(tensors):
+        for name, tensor in tensors:
+            if tp.size > 1:
+                match = _FP8_EXPERT_RE.match(name)
+                assert match is not None
+                tensor = _shard_fp8_expert(
+                    match["proj"],
+                    match["kind"],
+                    tensor,
+                    config.moe_intermediate_size,
+                    tp.size,
+                    tp.rank,
+                )
+            yield name, tensor
+
     if parallel is None:
         parallel = experts_scattered(model_path)
     if parallel:
-        tensors = iter_expert_tensors_parallel(
+        tensors = sharded_tensors(iter_expert_tensors_parallel(
             model_path, lambda n: locate(n) is not None, workers=workers, chunk=chunk
-        )
+        ))
         return per_expert_pieces(tensors, locate, tensors_per_expert=6)
 
     def _serial():
@@ -295,7 +411,7 @@ def iter_expert_pieces(model_path, config, kind: QuantKind, *, parallel: bool | 
         finally:
             reader.close()
 
-    return per_expert_pieces(_serial(), locate, tensors_per_expert=6)
+    return per_expert_pieces(sharded_tensors(_serial()), locate, tensors_per_expert=6)
 
 
 __all__ = ["iter_weights", "iter_expert_pieces", "nvfp4_expert_spec"]

@@ -126,6 +126,28 @@ def expert_bank_row_bytes(fmt: str, hidden_size: int, moe_intermediate_size: int
             "down_packed": H * (I // 2),
             "down_scale": H * (I // 32),
         }
+    if fmt == "awq":
+        # GEMM-AWQ qweight/qzeros pack eight output columns per int32; scales stay
+        # bf16 and use one row per group of 32 input values.
+        return {
+            "gate_up_qweight": 2 * H * (I // 8) * 4,
+            "gate_up_qzeros": 2 * (H // 32) * (I // 8) * 4,
+            "gate_up_scales": 2 * (H // 32) * I * 2,
+            "down_qweight": I * (H // 8) * 4,
+            "down_qzeros": (I // 32) * (H // 8) * 4,
+            "down_scales": (I // 32) * H * 2,
+        }
+    if fmt == "awq_marlin":
+        # vLLM Marlin W4A16 rows: repacked qweights plus Marlin-permuted bf16
+        # scales and packed AWQ zero points.
+        return {
+            "gate_up_qweight": (H // 16) * (4 * I) * 4,
+            "gate_up_qzeros": (H // 32) * (2 * I // 8) * 4,
+            "gate_up_scales": (H // 32) * (2 * I) * 2,
+            "down_qweight": (I // 16) * (2 * H) * 4,
+            "down_qzeros": (I // 32) * (H // 8) * 4,
+            "down_scales": (I // 32) * H * 2,
+        }
     raise ValueError(f"Unknown expert bank format {fmt!r}")
 
 

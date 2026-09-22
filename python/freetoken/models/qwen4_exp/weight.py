@@ -1,9 +1,10 @@
-"""Qwen3.8-Flash-Next checkpoint reader (the NVFP4 and the official block-fp8 releases).
+"""Qwen3.8-Flash-Next checkpoint reader (NVFP4, block-fp8 and AWQ releases).
 
 Three separate paths, because the checkpoint's three weight classes live in different places:
 
 * :func:`iter_weights` -- every dense (non-expert) tensor, with the ``model.language_model.`` prefix stripped and fused where the model expects one buffer. See ``_DenseFuser``.
 * :func:`load_ple_table` -- the 47.7 GiB FP8 n-gram table, 128 checkpoint shards concatenated into one pinned :class:`HostBank`.
+* :func:`iter_expert_pieces` -- routed block-fp8/AWQ expert streams for the offload cache.
 * :func:`nvfp4_expert_spec` -- how the routed NVFP4 experts are named, for the offload cache's expert reader.
 
 Dropped: ``mtp.*`` (speculative head, including its stacked ``mtp.layers.0.mlp.experts.*``); ``model.visual.*`` is kept only when the model built the tower.
@@ -24,11 +25,15 @@ from freetoken.distributed import get_tp_info
 from freetoken.models.qwen3_vl.weight import rename_vl_prefix
 
 from freetoken.models.config import VISION_KEY_PREFIXES
-from freetoken.models.loader import drop_page_cache, iter_weight_files, shard_tensor
+from freetoken.models.loader import ShardReader, drop_page_cache, iter_weight_files, shard_tensor
 from freetoken.models.nvfp4_banks import (
     Nvfp4ExpertSourceSpec,
 )
 from freetoken.layers.quantization import get_quant_config
+from freetoken.layers.quantization import QuantKind
+from freetoken.layers.quantization.scheme import FP8_BLOCK
+from freetoken.models.weight import experts_scattered, iter_expert_tensors_parallel
+from freetoken.moe.expert_pieces import per_expert_pieces
 from freetoken.models.register import get_model_spec
 from freetoken.moe.host_banks import HostBank, read_range_into
 from freetoken.utils import cached_load_hf_config, div_even, download_hf_weight
@@ -43,6 +48,10 @@ _EXPERT_KEY_RE = re.compile(
     r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
 )
 _EXPERT_RE = re.compile(r"\.mlp\.experts\.\d+\.")
+_AWQ_EXPERT_KEY_RE = re.compile(
+    r"^model\.language_model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
+    r"(?P<proj>gate_proj|up_proj|down_proj)\.(?P<kind>qweight|qzeros|scales)$"
+)
 _NVFP4_SOURCE_SPEC = Nvfp4ExpertSourceSpec(
     key_pattern=_EXPERT_KEY_RE,
     proj_to_role={"gate_proj": "gate", "up_proj": "up", "down_proj": "down"},
@@ -123,6 +132,19 @@ class _DenseFuser:
     def scheme(self, module: str):
         return None if self.quant is None else self.quant.scheme_for(module)
 
+    def stored(self, module: str):
+        """Return the scheme the checkpoint stores, not the deployment scheme.
+
+        ``--dense-quant fp8`` makes the wrapped config report eligible BF16 modules as
+        FP8 so the model builds compact runtime buffers.  The safetensors reader still
+        sees BF16 source tensors, however, and must validate those against the inner
+        checkpoint config before the engine performs the conversion.
+        """
+        if self.quant is None:
+            return None
+        checkpoint_name = self.quant.name_map.to_checkpoint(module)[0]
+        return self.quant.scheme_for_name(checkpoint_name)
+
     def _target(self, parent: str, leaf: str) -> tuple[str, int] | None:
         candidates = self.by_part.get(leaf)
         if not candidates:
@@ -140,8 +162,8 @@ class _DenseFuser:
         return f"{parent}.{fused}", idx
 
     def check(self, module: str, name: str, tensor: torch.Tensor) -> None:
-        """``tensor`` (checkpoint key ``name``) must match the scheme the model built ``module`` from."""
-        scheme = self.scheme(module)
+        """Validate a source tensor against the scheme stored in the checkpoint."""
+        scheme = self.stored(_split_kind(name)[0])
         if name.endswith(".weight_scale_inv"):
             if scheme is None or not scheme.has("weight_scale_inv"):
                 raise ValueError(f"{name}: {module} has no block scale in the checkpoint's quant config ({scheme})")
@@ -220,19 +242,41 @@ def _shard(name: str, t: torch.Tensor, config, rank: int, world: int) -> torch.T
         q = (config.num_qo_heads, 2 * config.head_dim)
         kv = (config.num_kv_heads, config.head_dim)
         return _shard_rows(t, [q, kv, kv], rank, world)
+    if name.endswith(".self_attn.qkv_proj.weight_scale_inv"):
+        q = (config.num_qo_heads, 2 * config.head_dim // FP8_BLOCK)
+        kv = (config.num_kv_heads, config.head_dim // FP8_BLOCK)
+        return _shard_rows(t, [q, kv, kv], rank, world)
     if ".linear_attn." in name:
         g = config.linear_attention_group()
         k = (g.num_key_heads, g.key_head_dim)
         v = (g.num_value_heads, g.value_head_dim)
         if name.endswith(".in_proj.weight"):
             return _shard_rows(t, [k, k, v, v, (v[0], 1), (v[0], 1)], rank, world)
+        if name.endswith(".in_proj_qkvz.weight"):
+            return _shard_rows(t, [k, k, v, v], rank, world)
+        if name.endswith(".in_proj_qkvz.weight_scale_inv"):
+            return _shard_rows(
+                t,
+                [
+                    (k[0], k[1] // FP8_BLOCK),
+                    (k[0], k[1] // FP8_BLOCK),
+                    (v[0], v[1] // FP8_BLOCK),
+                    (v[0], v[1] // FP8_BLOCK),
+                ],
+                rank,
+                world,
+            )
+        if name.endswith(".in_proj_ba.weight"):
+            return _shard_rows(t, [(v[0], 1), (v[0], 1)], rank, world)
         if name.endswith(".conv1d.weight"):
             return _shard_rows(t, [k, k, v], rank, world)
         if name.endswith((".A_log", ".dt_bias")):
             return _shard_rows(t, [(v[0], 1)], rank, world)
-        if name.endswith(".out_proj.weight"):
+        if name.endswith((".out_proj.weight", ".out_proj.weight_scale_inv")):
             return t.chunk(world, dim=1)[rank].clone()
         return t
+    if name.endswith((".self_attn.o_proj.weight_scale_inv", ".shared_expert.down_proj.weight_scale_inv")):
+        return t.chunk(world, dim=1)[rank].clone()
     if name.endswith(".shared_expert.gate_up_proj.weight"):
         half = t.shape[0] // 2
         return _shard_rows(t, [(half, 1), (half, 1)], rank, world)
@@ -441,7 +485,94 @@ def nvfp4_expert_spec(model_path: str, config):
     return _NVFP4_SOURCE_SPEC
 
 
+# ======================================================================================
+# Routed GEMM-AWQ experts
+# ======================================================================================
+
+
+def _shard_awq_tensor(tensor: torch.Tensor, proj: str, kind: str, *, rank: int, world: int) -> torch.Tensor:
+    """Shard a full GEMM-AWQ projection without unpacking its int4 columns."""
+    if world == 1:
+        return tensor.contiguous()
+    dim = 1 if proj in ("gate_proj", "up_proj") else 0
+    if tensor.shape[dim] % world:
+        raise ValueError(
+            f"AWQ {proj}.{kind} shape {tuple(tensor.shape)} cannot be split across TP={world}"
+        )
+    width = tensor.shape[dim] // world
+    if dim == 1:
+        return tensor[:, rank * width : (rank + 1) * width].contiguous()
+    # down_proj is row-parallel: qweight rows are K, while qzeros/scales rows are K / group.
+    return tensor[rank * width : (rank + 1) * width].contiguous()
+
+
+def _awq_piece_stream(model_path, config, *, parallel: bool, workers: int, chunk: int):
+    tp = get_tp_info()
+    key_re = _AWQ_EXPERT_KEY_RE
+
+    def locate(name: str):
+        match = key_re.match(name)
+        if match is None:
+            return None
+        proj = {"gate_proj": "gate", "up_proj": "up", "down_proj": "down"}[match["proj"]]
+        return int(match["layer"]), int(match["expert"]), f"{proj}_{match['kind']}"
+
+    def shard_tensors(tensors):
+        for name, tensor in tensors:
+            match = key_re.match(name)
+            if match is None:
+                continue
+            yield name, _shard_awq_tensor(
+                tensor,
+                match["proj"],
+                match["kind"],
+                rank=tp.rank,
+                world=tp.size,
+            )
+
+    if parallel:
+        tensors = iter_expert_tensors_parallel(
+            model_path,
+            lambda name: key_re.match(name) is not None,
+            workers=workers,
+            chunk=chunk,
+        )
+    else:
+        reader = ShardReader(model_path, torch.device("cpu"))
+
+        def serial():
+            try:
+                for layer in range(config.num_moe_layers):
+                    for expert in range(config.num_experts):
+                        base = f"model.language_model.layers.{layer}.mlp.experts.{expert}"
+                        for proj in ("gate_proj", "up_proj", "down_proj"):
+                            for kind in ("qweight", "qzeros", "scales"):
+                                name = f"{base}.{proj}.{kind}"
+                                yield name, reader.get_tensor(name)
+            finally:
+                reader.close()
+
+        tensors = serial()
+    return per_expert_pieces(shard_tensors(tensors), locate, tensors_per_expert=9)
+
+
+def iter_expert_pieces(
+    model_path, config, kind: QuantKind, *, parallel: bool | None = False, workers: int = 8, chunk: int = 8 << 20
+):
+    """Read Qwen4Exp AWQ pieces, or delegate other supported expert dialects."""
+    if kind is QuantKind.AWQ:
+        if parallel is None:
+            parallel = experts_scattered(model_path)
+        return _awq_piece_stream(model_path, config, parallel=parallel, workers=workers, chunk=chunk)
+    from freetoken.models.qwen3_5_moe.weight import iter_expert_pieces as shared_iter_expert_pieces
+
+    return shared_iter_expert_pieces(
+        model_path, config, kind, parallel=parallel, workers=workers, chunk=chunk
+    )
+
+
 __all__ = [
+    "iter_expert_pieces",
     "nvfp4_expert_spec",
     "PleTable",
     "iter_weights",

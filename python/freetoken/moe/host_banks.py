@@ -83,7 +83,7 @@ class HostBank:
 
     The buffer is rounded up to the O_DIRECT block; ``tensor`` views exactly ``nbytes``. ``backing=None`` follows ``FREETOKEN_BANK_CUDA_ALLOC``."""
 
-    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked")
+    __slots__ = ("tensor", "addr", "nbytes", "_buf", "_pinned", "_locked", "_file_backed")
 
     def __init__(self, shape: tuple[int, ...], dtype: torch.dtype,
                  *, backing: str | None = None):
@@ -108,13 +108,54 @@ class HostBank:
             self.addr = raw.data_ptr() + off
             assert self.addr % _BLK == 0
             self._pinned = True  # born pinned+mapped; pin() is a no-op
+            self._file_backed = False
         else:
             self._buf = mmap.mmap(-1, asize)  # lazy: address space only, no resident pages yet
             _LIVE_BUFFERS.append(self._buf)
             self.addr = ctypes.addressof(ctypes.c_char.from_buffer(self._buf))
             self._pinned = False
+            self._file_backed = False
         self.tensor = torch.frombuffer(self._buf, dtype=dtype, count=self.nbytes // elsize).view(*shape)
         self._locked = False
+
+    @classmethod
+    def from_file(cls, path: str, shape: tuple[int, ...], dtype: torch.dtype) -> "HostBank":
+        """Map an existing aligned bank file without copying it into anonymous RAM.
+
+        The shared expert-bank cache uses one file-backed mapping per process.  The mapping is
+        registered with CUDA by :meth:`pin`, so the normal zero-copy gather path sees a
+        device-visible host address while Linux can share the underlying file pages between
+        independent endpoints.  The mapping is writable only because this CUDA driver rejects
+        registration of read-only VMAs; runtime code treats it as read-only.
+        """
+        elsize = torch.empty((), dtype=dtype).element_size()
+        nbytes = math.prod(shape) * elsize
+        asize = ((nbytes + _BLK - 1) // _BLK) * _BLK
+        # CUDA host registration rejects a read-only VMA on this driver.  The cache files are
+        # private (0600) and the runtime never writes through this view, so use a shared
+        # writable mapping to keep the physical pages shareable while retaining the normal
+        # read-only-by-convention semantics.
+        fd = os.open(path, os.O_RDWR)
+        try:
+            if os.fstat(fd).st_size != asize:
+                raise ValueError(
+                    f"shared bank {path!r} is {os.fstat(fd).st_size} bytes; expected {asize}"
+                )
+            buf = mmap.mmap(fd, asize, flags=mmap.MAP_SHARED, prot=mmap.PROT_READ | mmap.PROT_WRITE)
+        finally:
+            os.close(fd)
+        self = cls.__new__(cls)
+        self._buf = buf
+        _LIVE_BUFFERS.append(buf)
+        self.nbytes = nbytes
+        self._pinned = False
+        self._locked = False
+        self._file_backed = True
+        self.tensor = torch.frombuffer(buf, dtype=dtype, count=nbytes // elsize).view(*shape)
+        # A read-only mmap cannot be passed to ctypes.from_buffer; the tensor view gives us
+        # the same base address without requiring a writable Python buffer.
+        self.addr = self.tensor.data_ptr()
+        return self
 
     @property
     def residency(self) -> HostResidency:
@@ -138,7 +179,20 @@ class HostBank:
         from freetoken.kernel.pinned import host_register
 
         try:
-            host_register(self.addr, len(self._buf))
+            if self._file_backed:
+                # Some CUDA 13 / Ampere driver combinations reject one large file-backed
+                # VMA even though smaller registrations are valid.  Register fixed aligned
+                # windows; all windows remain device-visible and the file pages remain
+                # shareable between endpoint processes.
+                try:
+                    chunk = int(os.environ.get("FREETOKEN_BANK_REGISTER_CHUNK_MB", "64")) << 20
+                except ValueError:
+                    chunk = 64 << 20
+                chunk = max(_BLK, (chunk // _BLK) * _BLK)
+                for offset in range(0, len(self._buf), chunk):
+                    host_register(self.addr + offset, min(chunk, len(self._buf) - offset))
+            else:
+                host_register(self.addr, len(self._buf))
         except RuntimeError as exc:
             raise PinFailed(f"cudaHostRegister failed for {len(self._buf) / 2**30:.1f} GiB") from exc
         self._pinned = True
