@@ -157,6 +157,47 @@ class HostBank:
         self.addr = self.tensor.data_ptr()
         return self
 
+    @classmethod
+    def from_file_region(
+        cls, path: str, offset: int, shape: tuple[int, ...], dtype: torch.dtype,
+    ) -> "HostBank":
+        """Map one aligned tensor region from a shared bank/shard file.
+
+        FTW per-layer entries are individually aligned and normally fit within one
+        shard. Mapping just that aligned range keeps the physical pages file-backed
+        and shareable between endpoint processes, while preserving the same
+        cudaHostRegister path as :meth:`from_file`.
+        """
+        if offset % _BLK:
+            raise ValueError(f"file-region offset {offset} is not {_BLK}-aligned")
+        elsize = torch.empty((), dtype=dtype).element_size()
+        nbytes = math.prod(shape) * elsize
+        asize = ((nbytes + _BLK - 1) // _BLK) * _BLK
+        fd = os.open(path, os.O_RDWR)
+        try:
+            file_size = os.fstat(fd).st_size
+            if offset + asize > file_size:
+                raise ValueError(
+                    f"file region {path!r}+{offset}..{offset + asize} exceeds "
+                    f"file size {file_size}"
+                )
+            buf = mmap.mmap(
+                fd, asize, flags=mmap.MAP_SHARED,
+                prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=offset,
+            )
+        finally:
+            os.close(fd)
+        self = cls.__new__(cls)
+        self._buf = buf
+        _LIVE_BUFFERS.append(buf)
+        self.nbytes = nbytes
+        self._pinned = False
+        self._locked = False
+        self._file_backed = True
+        self.tensor = torch.frombuffer(buf, dtype=dtype, count=nbytes // elsize).view(*shape)
+        self.addr = self.tensor.data_ptr()
+        return self
+
     @property
     def residency(self) -> HostResidency:
         if self._pinned:

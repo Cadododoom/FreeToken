@@ -57,6 +57,10 @@ These families accept image input by default; pass `--text-model-only` to skip t
 
 - `ft checkpoint` conversion is optional — it pre-converts a checkpoint into
   FreeToken's fast-load format, and `ft serve --model` auto-detects the result.
+- FTW checkpoints with per-layer expert-bank entries map those entries directly from
+  the shard files. This keeps the banks file-backed and lets independent endpoints
+  share physical host pages; entries that cross a shard boundary safely fall back to
+  the normal aligned read.
 - FTW files converted by builds before the quantization refactor may fail to load;
   see [ftw-hotfix.md](ftw-hotfix.md) for the affected checkpoints and the repair tool.
 - An FTW converted before its family served images holds no vision encoder: `ft serve`

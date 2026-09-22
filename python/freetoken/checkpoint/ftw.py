@@ -317,6 +317,24 @@ class FTWReader:
         if remaining:
             raise ValueError("tensor range exceeds FTW shards")
 
+    def single_shard_region(self, entry: dict) -> tuple[str, int] | None:
+        """Return ``(shard_path, aligned_file_offset)`` for a wholly local entry.
+
+        Per-layer FTW bank entries are aligned by the writer. A direct file-backed
+        HostBank is safe only when the entry's rounded tail remains in the same shard;
+        large or boundary-crossing entries return ``None`` and use ``read_into``.
+        """
+        pieces = list(self._pieces(entry["global_off"], entry["nbytes"]))
+        if len(pieces) != 1:
+            return None
+        file, file_off, _dest_off, length = pieces[0]
+        if file_off % ALIGN:
+            return None
+        shard = next(s for s in self.shards if s["file"] == file)
+        if file_off + _align_up(length) > shard["nbytes"]:
+            return None
+        return os.path.join(self.dir, file), file_off
+
     def read_into(self, dest: memoryview, entry: dict, *, workers: int = 8,
                   chunk: int = _DEFAULT_CHUNK) -> None:
         """Read one tensor's bytes into ``dest`` (length >= entry nbytes rounded to ALIGN)."""
@@ -522,7 +540,8 @@ def load_ftw_banks(
     row_hb: dict[str, list] = {}
     row_view_args: dict[str, list] = {}
     row_jobs = []  # (name, HostBank, window_off, window_len, layer_bytes) -- flat layout
-    layer_jobs = []  # (name, HostBank, entry) -- per-layer layout, direct aligned read
+    layer_jobs = []  # (name, HostBank, entry, layer_id) -- per-layer fallback reads
+    mapped_jobs = []  # (HostBank, nbytes, layer_id) -- per-layer file-backed maps
 
     for e in flat_entries:
         name = e["name"]
@@ -555,17 +574,34 @@ def load_ftw_banks(
         for layer_id in range(num_layers):
             e = by_layer[layer_id]
             assert e["global_off"] % ALIGN == 0, (base, layer_id, e["global_off"])  # writer invariant
-            bank = HostBank(tuple(e["shape"]), _dtype_of(e["dtype"]), backing=_backing(layer_id))
+            shape = tuple(e["shape"])
+            dtype = _dtype_of(e["dtype"])
+            region = reader.single_shard_region(e)
+            mapped = False
+            if region is not None:
+                path, offset = region
+                try:
+                    bank = HostBank.from_file_region(path, offset, shape, dtype)
+                except (OSError, ValueError) as exc:
+                    logger.warning(
+                        f"FTW bank {base} layer {layer_id}: file-backed map unavailable "
+                        f"({exc}); falling back to an aligned read"
+                    )
+                else:
+                    mapped_jobs.append((bank, e["nbytes"], layer_id))
+                    mapped = True
+            if not mapped:
+                bank = HostBank(shape, dtype, backing=_backing(layer_id))
+                layer_jobs.append((base, bank, e, layer_id))
             row_hb[base].append(bank)
             row_view_args[base].append(None)
-            layer_jobs.append((base, bank, e, layer_id))
 
     total_bytes = sum(e["nbytes"] for e in bank_entries)
     bar = byte_bar(total_bytes, "Loading expert banks (FTW)")
 
     # Jobs are per (bank, layer) -- many small reads, so a wider pool; each bank pins
     # as its read completes, overlapping cudaHostRegister with the remaining reads.
-    n_jobs = len(alpha_entries) + len(row_jobs) + len(layer_jobs)
+    n_jobs = len(alpha_entries) + len(row_jobs) + len(layer_jobs) + len(mapped_jobs)
     try:
         with PinPipeline() as pins:
 
@@ -587,6 +623,10 @@ def load_ftw_banks(
                 reader.read_into(bank.memoryview(), entry, workers=workers, chunk=chunk)
                 pins.submit(bank, residency[layer_id])
                 bar.update(entry["nbytes"])
+
+            for bank, nbytes, layer_id in mapped_jobs:
+                pins.submit(bank, residency[layer_id])
+                bar.update(nbytes)
 
             with ThreadPoolExecutor(min(max(_BANK_CONCURRENCY, 16), max(n_jobs, 1))) as ex:
                 futures = [ex.submit(_read_alpha, e) for e in alpha_entries]

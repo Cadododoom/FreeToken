@@ -4,6 +4,8 @@ import torch
 
 from freetoken.checkpoint.ftw import FTWReader, FTWWriter, ftw_tensor_names, iter_ftw_weights
 from freetoken.models.weight import ftw_lacks_vision, load_weight
+from freetoken.moe.expert_banks import load_expert_banks
+from freetoken.moe.host_banks import HostBank
 
 
 def _write_ftw(out_dir, names):
@@ -37,6 +39,54 @@ def test_no_keep_replays_every_entry(tmp_path):
     got = dict(iter_ftw_weights(str(tmp_path)))
     assert list(got) == list(tensors)
     assert torch.equal(got["visual.b.weight"], tensors["visual.b.weight"])
+
+
+def test_single_shard_ftw_region_maps_without_copy(tmp_path, monkeypatch):
+    tensor = torch.arange(4 * 8, dtype=torch.bfloat16).view(4, 8)
+    writer = FTWWriter(str(tmp_path))
+    writer.add_tensor("gate_up#L00000", tensor, kind="experts_bank")
+    index = writer.finalize({})
+    entry = index["tensors"][0]
+
+    reader = FTWReader(str(tmp_path))
+    region = reader.single_shard_region(entry)
+    assert region is not None
+    path, offset = region
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_PIN", "1")
+    bank = HostBank.from_file_region(path, offset, tuple(tensor.shape), tensor.dtype)
+    assert torch.equal(bank.tensor, tensor)
+    reader.close()
+
+
+def test_cross_shard_ftw_region_uses_copy_fallback(tmp_path):
+    writer = FTWWriter(str(tmp_path), shard_limit=4096)
+    tensor = torch.zeros(4096, dtype=torch.float32)
+    writer.add_tensor("gate_up#L00000", tensor, kind="experts_bank")
+    index = writer.finalize({})
+    reader = FTWReader(str(tmp_path))
+    assert reader.single_shard_region(index["tensors"][0]) is None
+    reader.close()
+
+
+def test_ftw_bank_loader_uses_file_backed_per_layer_entries(tmp_path, monkeypatch):
+    monkeypatch.setenv("FREETOKEN_SKIP_BANK_PIN", "1")
+    gate_up = torch.arange(16, dtype=torch.bfloat16).view(2, 8)
+    down = torch.arange(8, dtype=torch.bfloat16).view(2, 4)
+    writer = FTWWriter(str(tmp_path))
+    writer.add_tensor("gate_up#L00000", gate_up, kind="experts_bank")
+    writer.add_tensor("down#L00000", down, kind="experts_bank")
+    writer.finalize({"quant_format": "bf16", "expert_bank_num_layers": 1})
+
+    class Config:
+        num_moe_layers = 1
+
+    banks = load_expert_banks(
+        str(tmp_path), Config(), method=None, device=torch.device("cpu"),
+        dtype=torch.bfloat16, workers=1,
+    )
+    assert banks.layer_residency == ["pinned"]
+    assert torch.equal(banks.sources["gate_up"][0], gate_up)
+    assert torch.equal(banks.sources["down"][0], down)
 
 
 def test_load_weight_text_only_skips_the_tower(tmp_path):
