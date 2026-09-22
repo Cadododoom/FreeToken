@@ -26,6 +26,9 @@ AT_LOAD_FP8 = fp8_tensor_scheme("float", per_row=True)
 KEEP_BF16 = name_set((
     "*.gate", "*.shared_expert_gate", "*hyper_connection*", "*.indexer", "*.ple",
     "*.in_proj_ba", "*.in_proj_b", "*.in_proj_a",
+    # GLM MLA absorption consumes kv_b_proj as BF16 bmm operands; quantizing it
+    # before the absorption pass makes model construction invalid.
+    "*.kv_b_proj",
     "visual", "*.visual",
 ))
 
