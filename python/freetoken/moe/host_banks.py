@@ -43,8 +43,11 @@ class PinFailed(RuntimeError):
 class HostResidency(str, Enum):
     """Residency class of a host bank layer.
 
-    Only PINNED (cudaHostRegister'd) memory can feed the GPU movement paths; LOCKED (mlock'd, no device address) and PAGEABLE layers must decode on the CPU executor.
-    The non-pinned classes exist for hosts that cap CUDA pin quota (WSL/WDDM: ~half of RAM).
+    Only PINNED (cudaHostRegister'd) memory can feed the registered-host GPU movement
+    paths; LOCKED (mlock'd, no device address) and PAGEABLE layers normally decode on
+    the CPU executor. Explicit eager pageable staging may synchronously copy fetched rows
+    into GPU slots. The non-pinned classes exist for hosts that cap CUDA pin quota
+    (WSL/WDDM: ~half of RAM).
     """
 
     PINNED = "pinned"

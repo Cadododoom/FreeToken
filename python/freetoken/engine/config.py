@@ -49,6 +49,10 @@ class EngineConfig:
     kv_reserve_tokens: int = 8192  # KV floor for --moe-cache-auto; small by design (MoE-priority)
     moe_cache_policy: str = "lru"
     moe_prefill_overlap: bool = True
+    # Opt-in eager GPU staging for pageable/file-backed expert banks. This deliberately
+    # disables CUDA graphs; the first implementation synchronously gathers only fetched
+    # rows into the normal GPU slot cache.
+    moe_pageable_staging: bool = False
     # Prefill hit/miss split: serve cache-resident experts D2D during prefill
     # prefetch instead of re-streaming the full layer over PCIe. Needs CUDA >= 12.8
     # (cudaMemcpyBatchAsync); no-op unless moe_cache_size > 2 * num_experts.

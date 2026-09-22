@@ -690,7 +690,13 @@ def test_offload_cache_validate_rebuild_enforces_marlin_cap_and_floor():
         bf16.validate_rebuild(3)  # below the num_experts floor
 
 
-def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="cpu"):
+def _make_split_cache(
+    num_layers=2,
+    locked=(1,),
+    prefill_overlap=False,
+    device="cpu",
+    pageable_staging=False,
+):
     """A [gate_up, down] bf16 cache with the given layers LOCKED (rest pinned)."""
     from freetoken.moe.host_banks import HostResidency
     from freetoken.moe.offload_cache import OffloadMoeCache
@@ -700,8 +706,9 @@ def _make_split_cache(num_layers=2, locked=(1,), prefill_overlap=False, device="
     cache = OffloadMoeCache(
         num_layers=num_layers, num_experts=4, cache_size=8,
         device=dev, prefill_overlap=prefill_overlap,
+        pageable_staging=pageable_staging,
     )
-    cache.cpu_layer_ids = frozenset(locked)
+    cache.cpu_layer_ids = frozenset() if pageable_staging else frozenset(locked)
     src_dev = dev if dev.type == "cuda" else torch.device("cpu")
     sources = {
         # CUDA-resident pinned-layer sources keep _build_copy_plan's device_ptr happy in the CUDA variant; locked layers stay host tensors (never translated)
@@ -798,6 +805,59 @@ def test_locked_layer_copy_missing_rejects_ensure_experts_staging():
     cache._pending_whole_layer = False
     with pytest.raises(RuntimeError, match="unpinned"):
         cache.copy_missing()
+
+
+def test_pageable_staging_accepts_unregistered_gpu_decode_layers():
+    cache, _ = _make_split_cache(num_layers=2, locked=(1,), pageable_staging=True)
+
+    assert cache.cpu_layer_ids == frozenset()
+    assert cache._unpinned_layers == frozenset({1})
+    assert cache.pageable_staging_layer_ids == frozenset({1})
+
+
+def test_pageable_staging_copy_missing_preserves_lru_slot_remap():
+    cache, sources = _make_split_cache(num_layers=2, locked=(1,), pageable_staging=True)
+
+    cache._pending_src_layer = 1
+    cache._pending_whole_layer = False
+    cache.evict_slots[:2] = torch.tensor([6, 4], dtype=torch.int32)
+    cache.src_indices[:2] = torch.tensor([2, 0], dtype=torch.int32)
+    cache.num_indices.fill_(2)
+    cache.copy_missing()
+
+    for name, staged in cache.banks:
+        assert torch.equal(staged[6], sources[name][1][2])
+        assert torch.equal(staged[4], sources[name][1][0])
+
+
+def test_pageable_staging_copy_failure_invalidates_assigned_slots(monkeypatch):
+    cache, _ = _make_split_cache(num_layers=2, locked=(1,), pageable_staging=True)
+
+    cache._pending_src_layer = 1
+    cache._pending_whole_layer = False
+    cache.evict_slots[:2] = torch.tensor([6, 4], dtype=torch.int32)
+    cache.src_indices[:2] = torch.tensor([2, 0], dtype=torch.int32)
+    cache.num_indices.fill_(2)
+    cache.id_of_slot[6] = 4
+    cache.id_of_slot[4] = 5
+    cache.slot_for_id.view(-1)[4] = 6
+    cache.slot_for_id.view(-1)[5] = 4
+    cache.usage[6] = 11
+    cache.usage[4] = 12
+
+    def fail_copy(self, source, *, non_blocking=False):
+        raise RuntimeError("simulated pageable copy failure")
+
+    monkeypatch.setattr(torch.Tensor, "copy_", fail_copy)
+    with pytest.raises(RuntimeError, match="simulated pageable copy failure"):
+        cache.copy_missing()
+
+    assert cache.id_of_slot[6].item() == -1
+    assert cache.id_of_slot[4].item() == -1
+    assert cache.slot_for_id.view(-1)[4].item() == -1
+    assert cache.slot_for_id.view(-1)[5].item() == -1
+    assert cache.usage[6].item() == 0
+    assert cache.usage[4].item() == 0
 
 
 def test_requested_residency_routes_layer_settles(monkeypatch):

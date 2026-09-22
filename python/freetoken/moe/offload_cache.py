@@ -158,6 +158,10 @@ class OffloadMoeCache:
     # CPU absorbs the overflow misses, then the partials merge. The CPU executor is
     # attached (set_cpu_executor) for cpu/hybrid, set whenever >=1 layer decodes on the CPU.
     decode_target: str = "gpu"
+    # Opt-in eager path for layers whose host banks are intentionally PAGEABLE. The
+    # default remains the registered-host zero-copy path (or CPU decode for unpinned
+    # layers selected by the existing residency planner).
+    pageable_staging: bool = False
     # hybrid only: max experts fetched over PCIe per (layer, decode step); the rest
     # of that step's misses are computed on the CPU. 0 -> never fetch (CPU does every
     # miss, the GPU cache stays cold); large -> behaves like pure offload.
@@ -185,6 +189,9 @@ class OffloadMoeCache:
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-strategy cpu case).
         self.cpu_layer_ids: frozenset = frozenset()
+        # Set by set_bank_sources when pageable_staging is enabled. These layers retain
+        # the GPU decode path; their misses are synchronously copied row-by-row below.
+        self.pageable_staging_layer_ids: frozenset = frozenset()
         # num_experts floor + nvfp4_marlin slot cap, shared with the runtime-rebuild path.
         self.validate_rebuild(self.cache_size)
         assert not self.prefill_overlap or self.cache_size >= 2 * self.num_experts, (
@@ -332,7 +339,10 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
-        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
+        Non-pinned (LOCKED/PAGEABLE) layers have no device address: by default they must
+        already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call).
+        With explicit ``pageable_staging``, they instead use eager decode-time row copies;
+        either way prefill overlap is incompatible with them.
         """
         from freetoken.moe.legacy_format import canonical_role
         from freetoken.moe.host_banks import HostResidency
@@ -350,11 +360,14 @@ class OffloadMoeCache:
             i for i, r in enumerate(residency) if r != HostResidency.PINNED.value
         )
         if unpinned:
-            if not unpinned <= self.cpu_layer_ids:
+            allowed = self.cpu_layer_ids
+            staged = unpinned if self.pageable_staging else frozenset()
+            if not unpinned <= (allowed | staged):
                 raise ValueError(
-                    f"non-pinned layers {sorted(unpinned - self.cpu_layer_ids)} are not in "
+                    f"non-pinned layers {sorted(unpinned - allowed - staged)} are not in "
                     f"cpu_layer_ids: a layer without a device address can only decode on "
-                    f"the CPU executor (set cache.cpu_layer_ids before set_bank_sources)"
+                    f"the CPU executor or explicit pageable staging (set cache.cpu_layer_ids "
+                    f"or enable cache.pageable_staging before set_bank_sources)"
                 )
             if self.prefill_overlap:
                 raise ValueError(
@@ -362,6 +375,9 @@ class OffloadMoeCache:
                     "when any layer is LOCKED/PAGEABLE (the engine does this)"
                 )
         self._unpinned_layers = unpinned
+        self.pageable_staging_layer_ids = frozenset(
+            i for i in unpinned if self.pageable_staging and i not in self.cpu_layer_ids
+        )
         self.layer_residency = list(residency)
         for name in self.bank_schema:
             per_layer = sources[name]
@@ -434,7 +450,8 @@ class OffloadMoeCache:
                 return  # leave fused disabled; copy_missing uses the per-bank path
             for layer_id, source in enumerate(per_layer):
                 if layer_id in self._unpinned_layers:
-                    # unregistered layer: no device alias exists, and the row is never consumed (CPU decode; pageable prefill)
+                    # unregistered layer: no device alias exists. CPU-routed layers and
+                    # eager pageable-staging layers both use a non-fused copy path.
                     # a 0 placeholder keeps the descriptor shape
                     layer_src_ptrs[layer_id].append(0)
                     continue
@@ -599,6 +616,10 @@ class OffloadMoeCache:
         """Whether ``layer_id``'s host banks have no device address (LOCKED/PAGEABLE): the GPU slot-gather paths cannot serve it.
         ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id (never ``ensure_experts``'s LRU slot remap)."""
         return layer_id in self._unpinned_layers
+
+    def is_pageable_staging_layer(self, layer_id: int) -> bool:
+        """Whether decode should gather this unregistered layer into GPU slots eagerly."""
+        return layer_id in self.pageable_staging_layer_ids
 
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Per-slot global scales for a decode call, or ``None`` when the format
@@ -1041,11 +1062,14 @@ class OffloadMoeCache:
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
-                raise RuntimeError(
-                    f"layer {layer_id} is unpinned: its only copy is the whole-layer "
-                    f"pageable materialize (position == expert id); ensure_experts's "
-                    f"LRU slot remap cannot be honored without a device alias"
-                )
+                if not self.is_pageable_staging_layer(layer_id):
+                    raise RuntimeError(
+                        f"layer {layer_id} is unpinned: its only copy is the whole-layer "
+                        f"pageable materialize (position == expert id); enable pageable "
+                        f"staging to preserve ensure_experts's LRU slot remap"
+                    )
+                self._copy_missing_pageable(layer_id)
+                return
             # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into slots [0, num_experts) with position == expert id -- a plain synchronous pageable H2D copy
             # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
             for per_layer, cache in self.banks:
@@ -1078,6 +1102,45 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+
+    def _invalidate_slots(self, slots: list[int]) -> None:
+        """Drop newly assigned slots after an eager pageable copy fails."""
+        if not slots:
+            return
+        slot_ids = torch.tensor(slots, dtype=torch.long, device=self.device)
+        owners = self.id_of_slot[slot_ids].long()
+        valid = owners >= 0
+        if valid.any():
+            self.slot_for_id.view(-1)[owners[valid]] = -1
+        self.id_of_slot[slot_ids] = -1
+        self.usage[slot_ids] = 0
+
+    def _copy_missing_pageable(self, layer_id: int) -> None:
+        """Synchronously copy only LRU-fetched rows from pageable host banks.
+
+        This is intentionally eager-only. Reading ``num_indices``, ``evict_slots`` and
+        ``src_indices`` back to the host is incompatible with CUDA graph replay, but it
+        preserves the exact slot remapping and avoids copying a whole expert layer.
+        A later graph-safe version can replace this method with fixed pinned micro-staging
+        and a host coordinator without changing the cache or quantized GEMM contracts.
+        """
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        count = int(self.num_indices.item())
+        if count <= 0:
+            return
+        slots = self.evict_slots[:count].detach().cpu().tolist()
+        experts = self.src_indices[:count].detach().cpu().tolist()
+        try:
+            for per_layer, cache in self.banks:
+                source = per_layer[layer_id]
+                for slot, expert in zip(slots, experts):
+                    # non_blocking=False is deliberate: pageable host memory is not a
+                    # graph-safe async source, and the next GEMM must see completed bytes.
+                    cache[slot].copy_(source[expert], non_blocking=False)
+        except BaseException:
+            self._invalidate_slots(slots)
+            raise
 
 
 def iter_offload_moe_layers(model) -> Iterator:

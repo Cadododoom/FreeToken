@@ -94,3 +94,13 @@ def test_an_explicit_choice_beats_inference():
         pinned, _ = parse_args(["--model", ANON_PATH, "--reasoning-parser", "qwen3"])
     assert off.reasoning_parser is None
     assert pinned.reasoning_parser == "qwen3"
+
+
+def test_moe_pageable_staging_is_explicitly_opt_in():
+    config = _Config({"architectures": ["Qwen3MoeForCausalLM"], "torch_dtype": "bfloat16"})
+    with patch("freetoken.utils.cached_load_hf_config", lambda _path: config):
+        default, _ = parse_args(["--model", ANON_PATH])
+        staged, _ = parse_args(["--model", ANON_PATH, "--moe-pageable-staging"])
+
+    assert default.moe_pageable_staging is False
+    assert staged.moe_pageable_staging is True

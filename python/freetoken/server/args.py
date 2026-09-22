@@ -761,6 +761,17 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-pageable-staging",
+        action="store_true",
+        default=ServerArgs.moe_pageable_staging,
+        help=(
+            "Opt in to eager GPU decode with pageable/file-backed MoE banks. "
+            "Only fetched expert rows are copied into the GPU slot cache; CUDA graphs "
+            "are disabled because this first implementation synchronizes the host copy."
+        ),
+    )
+
+    parser.add_argument(
         "--enable-special-token-ckpt",
         action="store_true",
         dest="special_token_ckpt",

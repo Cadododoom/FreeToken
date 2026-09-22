@@ -414,6 +414,23 @@ def test_adjust_config_defaults_moe_cache_auto_for_auto_resolved_offload_backend
     assert config.moe_cache_size == 0  # still unresolved -- the scheduler sizes it from VRAM
 
 
+def test_adjust_config_pageable_staging_disables_all_cuda_graphs():
+    from freetoken.engine.engine import _adjust_config
+
+    config = _offload_engine_config(
+        moe_strategy="offload",
+        moe_pageable_staging=True,
+        cuda_graph_bs=[1, 2, 4],
+        cuda_graph_max_bs=4,
+    )
+    _adjust_config(config)
+
+    assert config.moe_pageable_staging is True
+    assert config.moe_prefill_overlap is False
+    assert config.cuda_graph_bs == []
+    assert config.cuda_graph_max_bs == 0
+
+
 def test_page_table_width_covers_whole_trailing_pages():
     # _write_page_table writes WHOLE trailing pages, so the width must reach the last
     # page's end, not just the next multiple of 32 (DSV4's P=128 exposed the gap).

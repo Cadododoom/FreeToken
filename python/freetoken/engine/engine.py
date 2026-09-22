@@ -654,7 +654,24 @@ class Engine:
     def _init_offload_moe_cache(self, config: EngineConfig) -> OffloadMoeCache:
         method = shared_offload_method(self.model)
         num_moe_layers = config.model_config.num_moe_layers
-        cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
+        if config.moe_pageable_staging:
+            # This mode deliberately keeps every layer on the GPU offload path while
+            # leaving the full host banks pageable. It is eager-only and incompatible
+            # with CPU/hybrid routing, whose executor would otherwise be initialized for
+            # the same layers.
+            if config.moe_strategy != "offload":
+                raise ValueError(
+                    "--moe-pageable-staging requires --moe-strategy offload "
+                    f"(got {config.moe_strategy!r})"
+                )
+            if config.moe_cpu_layers:
+                raise ValueError(
+                    "--moe-pageable-staging cannot be combined with --moe-cpu-layers; "
+                    "all MoE layers stay on the GPU offload path"
+                )
+            cpu_layer_ids = frozenset()
+        else:
+            cpu_layer_ids = _resolve_cpu_layers(config, num_moe_layers, reserved=self._host_tables_bytes, method=method)
         _check_pin_budget(config, reserved=self._host_tables_bytes, method=method)
         # the kernels were picked for model_config.decode_target; --moe-cpu-layers auto may still find that every bank fits the pin budget
         decode_target = config.model_config.decode_target
@@ -664,6 +681,8 @@ class Engine:
         # uncapped hosts keep every bank pinned (CPU decode reads them the same; overlap prefill stays on)
         # not applied to plain --moe-strategy cpu; all-locked under a cap = --moe-strategy offload --moe-cpu-layers 1.0
         split_residency = (
+            not config.moe_pageable_staging
+            and
             bool(cpu_layer_ids)
             and config.moe_strategy in ("offload", "hybrid")
             and _pin_budget_bytes(self._host_tables_bytes) is not None
@@ -682,11 +701,11 @@ class Engine:
                     f"--moe-strategy cpu: banks {bank_bytes / 2**30:.2f} GiB exceed the "
                     f"pin budget; OS-locking all layers instead of pinning"
                 )
-        if split_residency and config.moe_prefill_overlap:
+        if (config.moe_pageable_staging or split_residency) and config.moe_prefill_overlap:
             # locked (unregistered) layers cannot feed the async pinned H2D double buffer; their prefill is a synchronous pageable copy via materialize
             logger.info_rank0(
-                "--moe-cpu-layers split residency: disabling MoE prefill overlap "
-                "(locked layers prefill via synchronous pageable copies)"
+                "pageable/locked MoE residency: disabling prefill overlap "
+                "(unregistered layers prefill via synchronous pageable copies)"
             )
             object.__setattr__(config, "moe_prefill_overlap", False)
         # Fast path: an FTW checkpoint loads its repacked banks directly.
@@ -696,7 +715,13 @@ class Engine:
         # pick (parallel for scattered experts, with a low-RAM fallback to serial).
         expert_parallel = {"serial": False, "parallel": True}.get(config.expert_load, None)
         requested_residency = None
-        if split_residency:
+        if config.moe_pageable_staging:
+            from freetoken.moe.host_banks import HostResidency
+
+            requested_residency = [
+                HostResidency.PAGEABLE.value for _ in range(config.model_config.num_moe_layers)
+            ]
+        elif split_residency:
             from freetoken.moe.host_banks import HostResidency
 
             requested_residency = [
@@ -759,6 +784,7 @@ class Engine:
             prefill_hit_d2d=config.moe_prefill_hit_d2d,
             quant_format=banks.quant_format,
             decode_target=decode_target,
+            pageable_staging=config.moe_pageable_staging,
             hybrid_max_fetch=config.moe_hybrid_max_fetch,
             layout=layout,
             max_slots=max_slots,
@@ -1380,7 +1406,7 @@ def _pin_hint(reserved: int) -> str:
 
 def _check_pin_budget(config: EngineConfig, *, reserved: int, method=None) -> None:
     """Stop a plain offload boot whose banks exceed a known pin budget before any bank is read."""
-    if config.moe_cpu_layers or config.moe_strategy not in ("offload", "hybrid"):
+    if config.moe_pageable_staging or config.moe_cpu_layers or config.moe_strategy not in ("offload", "hybrid"):
         return
     budget = _pin_budget_bytes(reserved)
     bank_bytes = _bank_bytes(config, method) if budget is not None else None
@@ -1428,6 +1454,7 @@ _DENSE_MOE_SETTINGS = {
     "moe_cpu_threads": 0,
     "moe_hybrid_max_fetch": -1,
     "moe_prefill_overlap": True,
+    "moe_pageable_staging": False,
     "moe_prefill_hit_d2d": False,
     "expert_load": "auto",
 }
@@ -1768,6 +1795,26 @@ def _adjust_config(config: EngineConfig):
         logger.info_rank0(
             f"MoE backend 'cpu': decode computes experts on CPU; GPU keeps a "
             f"two-layer prefill buffer (moe_cache_size={2 * num_experts})"
+        )
+
+    if is_moe and config.moe_pageable_staging:
+        if config.moe_strategy != "offload":
+            raise ValueError(
+                "--moe-pageable-staging requires --moe-strategy offload "
+                f"(got {config.moe_strategy!r})"
+            )
+        if config.moe_cpu_layers:
+            raise ValueError(
+                "--moe-pageable-staging cannot be combined with --moe-cpu-layers"
+            )
+        # The eager pageable copy reads GPU-side LRU metadata back to the host. Never
+        # leave a user-supplied graph list active for this mode.
+        override("moe_prefill_overlap", False)
+        override("cuda_graph_bs", [])
+        override("cuda_graph_max_bs", 0)
+        logger.warning_rank0(
+            "--moe-pageable-staging enabled: using synchronous fetched-row GPU copies; "
+            "CUDA graphs and MoE prefill overlap are disabled"
         )
 
     if (
