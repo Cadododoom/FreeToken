@@ -185,6 +185,10 @@ class HostBank:
                 fd, asize, flags=mmap.MAP_SHARED,
                 prot=mmap.PROT_READ | mmap.PROT_WRITE, offset=offset,
             )
+            try:
+                buf.madvise(mmap.MADV_RANDOM)
+            except (AttributeError, OSError):
+                pass
         finally:
             os.close(fd)
         self = cls.__new__(cls)
