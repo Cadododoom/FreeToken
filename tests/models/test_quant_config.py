@@ -454,6 +454,26 @@ def test_modelopt_mixed_dialect_alias_reads_per_module_algorithms():
     assert quant.scheme_for("model.layers.0.mlp.experts.0.gate_proj").kind is QuantKind.NVFP4
 
 
+def test_modelopt_mixed_glm_absorption_boundaries_are_bf16():
+    """GLM's mixed KDA fusion and MLA absorption are explicitly dequantized by its reader."""
+    q = {
+        "quant_method": "modelopt_mixed",
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {
+            **{
+                f"model.layers.0.self_attn.{name}": {"quant_algo": "FP8_PB_WO"}
+                for name in ("q_proj", "k_proj", "v_proj")
+            },
+            "model.layers.3.self_attn.kv_b_proj": {"quant_algo": "FP8_PB_WO"},
+            "model.layers.3.self_attn.q_b_proj": {"quant_algo": "FP8_PB_WO"},
+        },
+    }
+    quant = QuantConfig.from_hf(SimpleNamespace(quantization_config=q))
+    assert quant.scheme_for("model.layers.0.self_attn.in_proj") is None
+    assert quant.scheme_for("model.layers.3.self_attn.kv_b_proj") is None
+    assert quant.scheme_for("model.layers.3.self_attn.q_b_proj").kind is QuantKind.FP8_BLOCK
+
+
 def test_every_dialect_names_the_tensors_behind_its_schemes():
     from freetoken.layers.quantization.registry import dialects
 

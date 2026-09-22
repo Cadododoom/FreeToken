@@ -95,6 +95,13 @@ def _select_expert_source_spec(model_path: str) -> Nvfp4ExpertSourceSpec:
     method = str(get("quant_method") or "").lower()
     return _NVFP4_CT_SOURCE_SPEC if method == "compressed-tensors" else _NVFP4_SOURCE_SPEC
 
+
+def _dequant_fp8_block(weight: torch.Tensor, scale: torch.Tensor, block: int = 128) -> torch.Tensor:
+    """Dequantize a float-scale block-FP8 matrix to BF16 for mixed fused projections."""
+    rows, cols = weight.shape
+    factors = scale.to(torch.float32).repeat_interleave(block, dim=0).repeat_interleave(block, dim=1)
+    return (weight.to(torch.float32) * factors[:rows, :cols]).to(torch.bfloat16)
+
 # KDA in_proj fusion order; MUST match Glm5NextKDA._in_proj_split.
 _KDA_IN_PROJ = ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj", "g_a_proj")
 
@@ -152,18 +159,32 @@ def _iter_kda_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
     src = f"{_CKPT}.layers.{layer}.self_attn"
     dst = f"{_MODEL}.layers.{layer}.self_attn"
     # One fused input GEMM: q|k|v|b|f_a|g_a (output-axis concat).
-    parts = [reader.get(f"{src}.{p}.weight") for p in _KDA_IN_PROJ]
-    if any(p.dtype == torch.float8_e4m3fn for p in parts):
-        raise NotImplementedError("fp8 KDA input projections are not fused by this reader")
+    parts = []
+    for index, part_name in enumerate(_KDA_IN_PROJ):
+        part = reader.get(f"{src}.{part_name}.weight")
+        # ModelOpt mixed exports may quantize q/k/v but leave b/f_a/g_a in BF16.
+        # The runtime owns one fused in_proj buffer, so dequantize only these mixed
+        # pieces before concatenation.  Row sharding must happen before the scale
+        # expansion for TP2.
+        if index < 4 and get_tp_info().size > 1:
+            part = _tp_slice_axis(part, 0)
+        if part.dtype == torch.float8_e4m3fn:
+            scale = reader.get(f"{src}.{part_name}.weight_scale_inv")
+            if index < 4 and get_tp_info().size > 1:
+                scale = _tp_slice_axis(scale, 0)
+            part = _dequant_fp8_block(part, scale)
+        else:
+            part = part.to(torch.bfloat16)
+        parts.append(part)
     # q|k|v|b are head/channel sharded; the low-rank f_a|g_a projections are
     # replicated because they feed a per-rank head slice in f_b/g_b below.
     local_parts = [
-        *[_tp_slice_axis(p, 0) for p in parts[:4]],
+        *parts[:4],
         parts[4],
         parts[5],
     ]
     yield f"{dst}.in_proj.weight", torch.cat(
-        [p.to(torch.bfloat16) for p in local_parts], dim=0
+        local_parts, dim=0
     )
     # One merged depthwise conv over the q|k|v stream (channel-axis concat).
     conv = torch.cat(
@@ -187,7 +208,17 @@ def _iter_dsa_layer(reader, layer: int) -> Iterator[tuple[str, torch.Tensor]]:
     src = f"{_CKPT}.layers.{layer}.self_attn"
     dst = f"{_MODEL}.layers.{layer}.self_attn"
     for proj in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"):
-        yield from _proj(reader, f"{src}.{proj}", f"{dst}.{proj}")
+        if proj == "kv_b_proj":
+            weight = reader.get(f"{src}.{proj}.weight")
+            if weight.dtype == torch.float8_e4m3fn:
+                weight = _dequant_fp8_block(
+                    weight, reader.get(f"{src}.{proj}.weight_scale_inv")
+                )
+            else:
+                weight = weight.to(torch.bfloat16)
+            yield f"{dst}.{proj}.weight", weight
+        else:
+            yield from _proj(reader, f"{src}.{proj}", f"{dst}.{proj}")
     for norm in ("q_a_layernorm", "kv_a_layernorm"):
         yield f"{dst}.{norm}.weight", reader.get(f"{src}.{norm}.weight").to(torch.bfloat16)
     # kpool indexer (every DSA layer owns one). Kept bf16; the APE is fp32.

@@ -62,6 +62,32 @@ class ModelOptConfig(QuantConfig):
         algo = self._module_algo(name)
         return None if algo is None else self._scheme_of(algo)
 
+    def scheme_for(self, prefix: str) -> QuantScheme | None:
+        """Allow GLM's mixed-precision KDA input fusion to load as one BF16 buffer.
+
+        The checkpoint quantizes q/k/v but keeps b/f_a/g_a in BF16, while the model
+        exposes all six projections as one fused ``in_proj``.  The GLM reader
+        dequantizes the FP8 pieces before concatenation; do not let the generic
+        fused-module consistency check reject that deliberate boundary.
+        """
+        if prefix in self._schemes:
+            return self._schemes[prefix]
+        if self.algo == "MIXED_PRECISION" and prefix.endswith(".self_attn.in_proj"):
+            names = self.name_map.to_checkpoint(prefix)
+            schemes = {self.scheme_for_name(name) for name in names}
+            if schemes == {None, self._scheme_of("FP8_PB_WO")}:
+                self._schemes[prefix] = None
+                return None
+        if self.algo == "MIXED_PRECISION" and prefix.endswith(".self_attn.kv_b_proj"):
+            # GLM MLA absorption consumes kv_b as a BF16 bmm operand.  Mixed
+            # checkpoints may store it as FP8, so the GLM reader dequantizes it
+            # before the model constructs its absorbed K/V views.
+            scheme = self.scheme_for_name(self.name_map.to_checkpoint(prefix)[0])
+            if scheme == self._scheme_of("FP8_PB_WO"):
+                self._schemes[prefix] = None
+                return None
+        return super().scheme_for(prefix)
+
     def _module_algo(self, name: str) -> str | None:
         if self.algo != "MIXED_PRECISION":
             return self.algo
