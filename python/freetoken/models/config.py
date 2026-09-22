@@ -23,6 +23,18 @@ def detect_expert_quant(hf_config: Any) -> str:
     algo = get("quant_algo") or get("quant_method")
     if algo is None:
         return "none"
+    # Newer ModelOpt mixed exports use quant_method=modelopt_mixed and put the
+    # actual per-module algorithms in quantized_layers.  The routed experts are
+    # still the NVFP4 bank format even though the top-level algorithm is mixed.
+    if str(algo).lower() in ("mixed_precision", "modelopt_mixed"):
+        layers = get("quantized_layers") or {}
+        if isinstance(layers, dict):
+            for name, entry in layers.items():
+                if "expert" not in str(name).lower():
+                    continue
+                layer_algo = entry.get("quant_algo") if isinstance(entry, dict) else None
+                if "nvfp4" in str(layer_algo or "").lower():
+                    return "nvfp4"
     if "fp4" in str(algo).lower():
         return "nvfp4"
     fmt = str(get("format") or "").lower()

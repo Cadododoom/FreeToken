@@ -157,6 +157,20 @@ _NVFP4_QUANT = {
     "ignore": ["lm_head", "model.visual.*"],
 }
 
+_MODELOPT_MIXED_QUANT = {
+    # Current community GLM-5.3 mixed exports use this newer dialect spelling.
+    "quant_method": "modelopt_mixed",
+    "quant_algo": "MIXED_PRECISION",
+    "quantized_layers": {
+        "model.language_model.layers.3.mlp.experts.0.gate_proj": {
+            "quant_algo": "W4A16_NVFP4"
+        },
+        "model.language_model.layers.3.self_attn.q_proj": {
+            "quant_algo": "FP8_PB_WO"
+        },
+    },
+}
+
 
 def test_attention_groups():
     cfg = parse_config(_hf_config())
@@ -276,6 +290,12 @@ def test_compressed_tensors_nvfp4_detected():
     """RedHatAI/GLM-5.3-Flash-NVFP4 (llm-compressor): expert_quant resolves to
     nvfp4 off the ``format`` field (quant_algo is absent for compressed-tensors)."""
     cfg = parse_config(_hf_config(_CT_NVFP4_QUANT))
+    assert cfg.expert_quant == "nvfp4"
+
+
+def test_modelopt_mixed_nvfp4_detected():
+    """ModelOpt mixed GLM exports must route their per-expert W4A16 banks as NVFP4."""
+    cfg = parse_config(_hf_config(_MODELOPT_MIXED_QUANT))
     assert cfg.expert_quant == "nvfp4"
 
 
