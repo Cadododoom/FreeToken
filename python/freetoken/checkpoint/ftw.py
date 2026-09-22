@@ -37,6 +37,7 @@ import math
 import mmap
 import os
 import re
+import stat
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -59,6 +60,10 @@ _ALPHA_NAMES = ("gate_up_alpha", "down_alpha")
 # Per-layer expert-bank entry name (converter streaming path, see checkpoint/convert.py):
 # each layer of a bank is its own FTW tensor instead of one flat [num_layers*E, ...] region.
 _LAYER_ENTRY_RE = re.compile(r"^(?P<base>.+)#L(?P<layer>\d{5})$")
+
+
+class FTWFormatError(ValueError):
+    """The FTW index or one of its declared files is structurally invalid."""
 
 
 def layer_bank_entry_name(bank_name: str, layer_id: int) -> str:
@@ -100,6 +105,120 @@ def _dtype_of(s: str) -> torch.dtype:
 
 def _elsize(dt: torch.dtype) -> int:
     return torch.empty((), dtype=dt).element_size()
+
+
+def _index_int(value, field: str, *, minimum: int = 0) -> int:
+    if type(value) is not int or value < minimum:
+        raise FTWFormatError(f"{field} must be an integer >= {minimum}, got {value!r}")
+    return value
+
+
+def _validate_ftw_index(path: str, index: dict) -> tuple[list[dict], list[dict]]:
+    """Validate the FTW v1 geometry before any mmap or direct-I/O operation."""
+    if not isinstance(index, dict):
+        raise FTWFormatError(f"FTW index root must be an object: {path}")
+    if index.get("format") != FORMAT_TAG:
+        raise FTWFormatError(f"not a {FORMAT_TAG} checkpoint: {path}")
+    if index.get("version") != FORMAT_VERSION:
+        raise FTWFormatError(f"unsupported FTW version: {index.get('version')!r}")
+    if index.get("align") != ALIGN:
+        raise FTWFormatError(f"unsupported FTW alignment: {index.get('align')!r}")
+
+    total_bytes = _index_int(index.get("total_bytes"), "total_bytes")
+    if total_bytes % ALIGN:
+        raise FTWFormatError(f"total_bytes must be {ALIGN}-aligned")
+    shard_limit = _index_int(index.get("shard_limit"), "shard_limit", minimum=ALIGN)
+    if shard_limit % ALIGN:
+        raise FTWFormatError(f"shard_limit must be {ALIGN}-aligned")
+
+    raw_shards = index.get("shards")
+    if not isinstance(raw_shards, list):
+        raise FTWFormatError("shards must be an array")
+    shards: list[dict] = []
+    names: set[str] = set()
+    for i, shard in enumerate(raw_shards):
+        if not isinstance(shard, dict):
+            raise FTWFormatError(f"shards[{i}] must be an object")
+        file = shard.get("file")
+        if (not isinstance(file, str) or not file or file in {".", ".."}
+                or os.path.basename(file) != file or "/" in file or "\\" in file
+                or "\x00" in file):
+            raise FTWFormatError(f"shards[{i}].file is not a safe basename")
+        if file in names:
+            raise FTWFormatError(f"duplicate FTW shard file: {file!r}")
+        names.add(file)
+        global_off = _index_int(shard.get("global_off"), f"shards[{i}].global_off")
+        nbytes = _index_int(shard.get("nbytes"), f"shards[{i}].nbytes")
+        if global_off % ALIGN or nbytes % ALIGN:
+            raise FTWFormatError(f"shards[{i}] offsets and sizes must be {ALIGN}-aligned")
+        if nbytes > shard_limit:
+            raise FTWFormatError(f"shards[{i}] exceeds shard_limit")
+        shard_path = os.path.join(path, file)
+        try:
+            info = os.stat(shard_path)
+        except OSError as exc:
+            raise FTWFormatError(f"cannot stat FTW shard {file!r}: {exc}") from exc
+        if not stat.S_ISREG(info.st_mode) or info.st_size != nbytes:
+            raise FTWFormatError(
+                f"FTW shard {file!r} is not a regular file of the indexed size "
+                f"({nbytes}; actual {info.st_size})"
+            )
+        shards.append(shard)
+
+    shards.sort(key=lambda item: item["global_off"])
+    cursor = 0
+    for shard in shards:
+        if shard["global_off"] != cursor:
+            raise FTWFormatError("FTW shards contain a gap or overlap")
+        cursor += shard["nbytes"]
+    if cursor != total_bytes:
+        raise FTWFormatError(f"FTW shards cover {cursor} bytes, expected {total_bytes}")
+
+    raw_tensors = index.get("tensors")
+    if not isinstance(raw_tensors, list):
+        raise FTWFormatError("tensors must be an array")
+    tensors: list[dict] = []
+    tensor_names: set[str] = set()
+    allocations: list[tuple[int, int, str]] = []
+    for i, tensor in enumerate(raw_tensors):
+        if not isinstance(tensor, dict):
+            raise FTWFormatError(f"tensors[{i}] must be an object")
+        name = tensor.get("name")
+        if not isinstance(name, str) or name in tensor_names:
+            raise FTWFormatError(f"invalid or duplicate tensor name at tensors[{i}]")
+        tensor_names.add(name)
+        dtype_name = tensor.get("dtype")
+        dtype = getattr(torch, dtype_name, None) if isinstance(dtype_name, str) else None
+        if not isinstance(dtype, torch.dtype):
+            raise FTWFormatError(f"unknown tensor dtype at tensors[{i}]: {dtype_name!r}")
+        shape = tensor.get("shape")
+        if not isinstance(shape, list) or any(type(dim) is not int or dim < 0 for dim in shape):
+            raise FTWFormatError(f"invalid tensor shape at tensors[{i}]")
+        numel = math.prod(shape) if shape else 1
+        expected = numel * _elsize(dtype)
+        nbytes = _index_int(tensor.get("nbytes"), f"tensors[{i}].nbytes")
+        if nbytes != expected:
+            raise FTWFormatError(
+                f"tensor {name!r} declares {nbytes} bytes; shape/dtype require {expected}"
+            )
+        global_off = _index_int(tensor.get("global_off"), f"tensors[{i}].global_off")
+        if global_off % ALIGN:
+            raise FTWFormatError(f"tensor {name!r} offset is not {ALIGN}-aligned")
+        padded_end = _align_up(global_off + nbytes)
+        if padded_end > total_bytes:
+            raise FTWFormatError(f"tensor {name!r} extends beyond the FTW payload")
+        if nbytes:
+            allocations.append((global_off, padded_end, name))
+        tensors.append(tensor)
+
+    cursor = 0
+    for start, end, name in sorted(allocations):
+        if start != cursor:
+            raise FTWFormatError(f"FTW tensor coverage has a gap or overlap at {name!r}")
+        cursor = end
+    if cursor != total_bytes:
+        raise FTWFormatError(f"FTW tensors cover {cursor} bytes, expected {total_bytes}")
+    return shards, tensors
 
 
 def is_ftw_checkpoint(path: str) -> bool:
@@ -215,12 +334,14 @@ class FTWReader:
     (the rounding reads into the region's padding, which is discarded by the tensor view)."""
 
     def __init__(self, path: str):
-        with open(os.path.join(path, INDEX_NAME)) as f:
-            self.index = json.load(f)
-        assert self.index.get("format") == FORMAT_TAG, f"not a {FORMAT_TAG}: {path}"
+        try:
+            with open(os.path.join(path, INDEX_NAME), encoding="utf-8") as f:
+                self.index = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, RecursionError) as exc:
+            raise FTWFormatError(f"malformed FTW index in {path!r}: {exc}") from exc
         self.dir = path
-        self.shards = sorted(self.index["shards"], key=lambda s: s["global_off"])
-        self.tensors = {t["name"]: t for t in self.index["tensors"]}
+        self.shards, tensors = _validate_ftw_index(path, self.index)
+        self.tensors = {t["name"]: t for t in tensors}
         self._fds: dict[str, int] = {}
         self._maps: dict[str, tuple[mmap.mmap, memoryview]] = {}
         # O_DIRECT (DMA straight from disk, bypassing the page cache) is the fast path but a
@@ -701,6 +822,6 @@ def load_ftw_banks(
 
 __all__ = [
     "INDEX_NAME", "FORMAT_TAG", "FORMAT_VERSION", "ALIGN", "DEFAULT_SHARD_LIMIT",
-    "is_ftw_checkpoint", "ftw_tensor_names", "FTWWriter", "FTWReader",
+    "FTWFormatError", "is_ftw_checkpoint", "ftw_tensor_names", "FTWWriter", "FTWReader",
     "iter_ftw_weights", "load_ftw_banks", "layer_bank_entry_name",
 ]
