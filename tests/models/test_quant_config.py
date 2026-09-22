@@ -439,6 +439,21 @@ def test_modelopt_nvfp4_reads_the_activation_quantizer_from_config_groups(extra,
     assert scheme.kind is QuantKind.NVFP4 and scheme.has("input_scale") is has_input_scale
 
 
+def test_modelopt_mixed_dialect_alias_reads_per_module_algorithms():
+    """ModelOpt mixed checkpoints published with ``modelopt_mixed`` use the same dialect payload."""
+    q = {
+        "quant_method": "modelopt_mixed",
+        "quant_algo": "MIXED_PRECISION",
+        "quantized_layers": {
+            "model.layers.0.mlp.experts.0.gate_proj": {"quant_algo": "W4A16_NVFP4"},
+        },
+    }
+    quant = QuantConfig.from_hf(SimpleNamespace(quantization_config=q))
+    assert type(quant) is ModelOptConfig
+    assert quant.scheme_for("model.layers.0.mlp.experts") is None
+    assert quant.scheme_for("model.layers.0.mlp.experts.0.gate_proj").kind is QuantKind.NVFP4
+
+
 def test_every_dialect_names_the_tensors_behind_its_schemes():
     from freetoken.layers.quantization.registry import dialects
 
